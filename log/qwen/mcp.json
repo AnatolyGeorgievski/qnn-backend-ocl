@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "fetch": {
+      "command": "/home/george/venvs/mcp-fetch/bin/mcp-server-fetch",
+      "args": [
+        "--ignore-robots-txt"
+      ],
+      "timeout_ms": 120000
+    }
+  }
+}
