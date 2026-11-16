@@ -1,4 +1,4 @@
-// id tensor_set CL_BLOCKING mod and ggml_backend_opencl_set_tensor_async:  NON_BLOCKING
+/* Бэкенд OpenCL. Вход — ggml_backend_opencl_init, выход — ggml_backend_opencl_free. Классы: устройство, ggml_backend_opencl_context, буфер ggml_backend_opencl_buffer_context. */
 
 //#define GGML_OPENCL_PROFILING 1
 #define _TEST 0
@@ -312,10 +312,7 @@ struct ggml_backend_opencl_device_context {
 // классификатор из двух параметров
 #define K2(t1,td) ((GGML_TYPE_##t1)<<8|(GGML_TYPE_##td))
 #define K3(t1,t2,td) ((GGML_TYPE_##t1)<<8|(GGML_TYPE_##t2)<<8|(GGML_TYPE_##td))
-/*!
-
- */
-// backend context
+/* ggml_backend_opencl_context. Вход — ggml_cl2_init, выход — ggml_cl2_free. Держу устройство, очередь и ядра. alignment — байты, CL_DEVICE_MEM_BASE_ADDR_ALIGN делю на 8. */
 struct ggml_backend_opencl_context {
     cl_device_id device;
     std::string device_name;
@@ -1342,7 +1339,7 @@ static void ggml_backend_opencl_free(ggml_backend_t backend) {
 
     GGML_UNUSED(backend);
 }
-// todo
+/* Запись не ждёт. Готовность — extra->evt. offset — байты от начала тензора, не от базы буфера. */
 static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -1357,7 +1354,6 @@ static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_te
 
 printf("ASYNC SET %s\n", tensor->name);
 }
-// todo
 static void ggml_backend_opencl_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_UNUSED(backend);
     GGML_UNUSED(tensor);
@@ -1918,15 +1914,8 @@ bool ggml_backend_is_opencl(ggml_backend_t backend) {
     return backend && backend->iface.get_name == ggml_backend_opencl_name;
 }
 
-//
-// buffer
-//
+/* ggml_backend_opencl_buffer_context. Я держу блок cl_mem. Вход — alloc, выход — free. Пары: init_tensor и reset, set и get, memset и clear. get_base отдаёт cl_ptr_base, это 0x1000. Смещение — data минус база, view_offs в него не входит. На одно смещение один описатель. Вид садится на описатель родителя. cpy пуст. */
 struct ggml_backend_opencl_buffer_context {
-    // A buffer context can hold multiple cl_mem objects. This is for flattening
-    // quantized weights and should be used with GGML_OPENCL_SMALL_ALLOC where
-    // each tensor is allocated a separate buffer. When flattening is enabled
-    // with small allocation, each tensor is backed by two cl_mem objects (for
-    // quants and scales) packed into a backend_opencl_buffer.
     ggml_backend_opencl_buffer_context(cl_mem buf)
         : name("OpenCL") {
         buffer.push_back(buf);
@@ -1940,7 +1929,6 @@ struct ggml_backend_opencl_buffer_context {
             CL_CHECK(clReleaseMemObject(im));
         }
 
-        // Delete all extras to trigger their destructors
         for (ggml_tensor_extra_cl * e : temp_tensor_extras) {
             delete e;
         }
@@ -1998,44 +1986,82 @@ struct ggml_backend_opencl_buffer_context {
         temp_tensor_extras_q4_0_in_use.clear();
     }
 
-    // Pools for extras. Available extras are in `temp_tensor_extras`. Extras
-    // being used are in `temp_tensor_extras_in_use`. At the first run, new
-    // extras get created and put in `in_use`. When the buffer is reset via
-    // the `reset` callback, all extras in `in_use` get moved to available extras
-    // for reuse.
     std::vector<ggml_tensor_extra_cl *> temp_tensor_extras;
     std::vector<ggml_tensor_extra_cl *> temp_tensor_extras_in_use;
     std::vector<ggml_tensor_extra_cl_q4_0 *> temp_tensor_extras_q4_0;
     std::vector<ggml_tensor_extra_cl_q4_0 *> temp_tensor_extras_q4_0_in_use;
 
-    // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
-    // before any tensor is initialized (at the beginning of alloc_tensor_range).
-    // Hence, there is alway a buffer object in this vector. When each tensor is
-    // being initialized, this original buffer object will be released if both
-    // flattening and small allocation are enabled, and additional buffer
-    // objects will be created in init_tensor to represent flattened quantized
-    // weights.
+    ggml_tensor_extra_cl * lookup_plain_extra(size_t offset) const {
+        auto it = plain_by_offset.find(offset);
+        if (it == plain_by_offset.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    void register_plain_extra(size_t offset, ggml_tensor_extra_cl * extra) {
+        plain_by_offset[offset] = extra;
+    }
+
+    std::unordered_map<size_t, ggml_tensor_extra_cl *> plain_by_offset;
+
     std::vector<cl_mem> buffer;
-    // These are image1d_buffer_t objects that wrap around the quants and scales.
-    // For Q4_0 quantization, there should be two of them - one for quants and
-    // one for scales. They should be populated only when flattening and small
-    // allocation are enabled.
-    std::vector<cl_mem> img;
+    std::vector<cl_mem> img; // image1d квантов и шкал Q4_0
     std::string name;
 };
 
-static void * const cl_ptr_base = (void *)(uintptr_t) 0x1000;
+
+static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size);
+static void                   ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer);
+static enum ggml_status       ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor);
+static void                   ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer);
+static void                   ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+static void                   ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size);
+static void                   ggml_backend_opencl_buffer_memset(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
+static void                   ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value);
+static void *                 ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer);
+
+static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_opencl_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_opencl_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_opencl_buffer_memset,
+    /* .set_tensor      = */ ggml_backend_opencl_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_opencl_buffer_clear,
+    /* .reset           = */ ggml_backend_opencl_buffer_reset,
+};
+
+/* size меньше страницы поднимаю до 0x1000: clCreateBuffer на нуле возвращает -61. */
+static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
+    ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer_type->device);
+
+    size = std::max(size, (size_t)0x1000);
+
+    char buf[128];
+    sprintf(buf, "ALLOC_BUF %.2f MB", size / 1024.0 / 1024.0);
+    puts(buf);
+    GGML_LOG_INFO("qnn_ocl block alloc %.2f MB live=%ld\n", size / 1024.0 / 1024.0, (long) g_qnn_cl_blocks.load());
+    cl_int err;
+
+    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_INFO("%s: failed to allocate %.2f MiB\n", __func__, size / 1024.0 / 1024.0);
+        return nullptr;
+    }
+
+    ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
+
+    return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
+}
 
 static void ggml_backend_opencl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
     delete ctx;
 }
 
-static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
-    return cl_ptr_base;
-
-    GGML_UNUSED(buffer);
-}
+static void * const cl_ptr_base = (void *)(uintptr_t) 0x1000;
 
 static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
@@ -2048,22 +2074,6 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         ggml_tensor_extra_cl * view_extra = (ggml_tensor_extra_cl *) tensor->view_src->extra;
         GGML_ASSERT(view_extra && "view_extra is nullptr?");
 
-        // Reuse extra of the parent tensor. The offset of this view tensor
-        // becomes `extra->offset + view_offs` and needs to be calculated when
-        // it is used. This changes is needed because of the change to
-        // ggml_alloc.c in https://github.com/ggerganov/llama.cpp/pull/7640.
-        // `buffer` passed in here will always be `tensor->buffer`. It is OK
-        // to allocate extras from the same buffer context for ordinary
-        // intermediate tensors. But for views into kv cache tensors, doing so
-        // would mess up the extras used by kv cache.
-        // Before #7640, `buffer` is for intermediate tensors, which is always
-        // different from that of kv cache tensors.
-        //
-        // NB: now extra->offset no longer accounts for view_offs.
-        // NB: this should not apply to weight tensors (for end-to-end runs, but
-        //     may apply for test-backend-ops).
-        // FIXME: if any unexpected results are seen, double check the offset -
-        // there could be other places that need fix.
         tensor->extra = view_extra;
 #if defined(_TEST) && _TEST>3
         //size_t offset = (char *)tensor->data - (char *)cl_ptr_base;
@@ -2086,6 +2096,11 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         tensor->extra = extra;
     }
     return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
+    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    ctx->reset();
 }
 
 // The optimized gemm and gemv kernels are used for large matrices without batch.
@@ -2469,6 +2484,7 @@ static void ggml_backend_opencl_buffer_memset    (ggml_backend_buffer_t buffer, 
         extra->offset + tensor->view_offs + offset, size, extra->evt==nullptr?0:1, &extra->evt, &extra->evt));
 
 }
+
 static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_dev_t dev = buffer->buft->device;
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);
@@ -2481,88 +2497,26 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
     CL_CHECK(clFinish(queue));
 }
 
-static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
-    ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-    ctx->reset();
+
+static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return cl_ptr_base;
+
+    GGML_UNUSED(buffer);
 }
 
-/* Контракт слотов буфера. Таблица пассивная: слот сам ничего не делает,
- * тело даёт сторона, которая держит память устройства.
- * Пустой слот значит «этого шага нет», зовущий идёт запасным путём.
- *
- * free_buffer    — отпускает буфер и память устройства. После вызова указатель буфера мёртв.
- * get_base       — возвращает базовый адрес, от которого считаются смещения тензоров.
- * init_tensor    — сажает тензор в буфер и собирает его описатель на этой стороне.
- * memset_tensor  — заполняет кусок тензора одним байтом. Пустой слот: заполнения нет.
- * set_tensor     — кладёт range в тензор. В разогнутом RPC это тот же протокол, что у cpy.
- * get_tensor     — забирает range из тензора. Тот же протокол, что у set и cpy.
- * cpy_tensor     — второй тензор на данные первого.
- *                  Веса — константы, как строки JSON: ссылка на исходный блок,
- *                  при разборе строку не копируем и при клоне узла тоже.
- *                  Байты копируем только когда данным надо разойтись.
- *                  Ради второго описателя на том же массиве GPU на хост не выгружаем.
- *                  Пустой слот у чужого зовущего — get, затем set: это как раз пустая выгрузка.
- * clear          — заполняет весь буфер одним байтом.
- * reset          — возвращает занятые описатели тензоров в свободный список.
- *                  Пустой слот: возвращать нечего. У CUDA слот пустой. Аллокатор графа
- *                  зовёт reset перед раскладкой и при пустом слоте сразу идёт дальше.
- *
- * set_tensor_2d, get_tensor_2d, set_tensor_n, get_tensor_n, cpy_tensor_n
- * в канон не входят. Проверено по зовущему ggml_backend_tensor_set_2d / set_n /
- * get_2d / get_n / copy_n: пустой слот — тот же результат циклом set_tensor,
- * get_tensor или cpy_tensor. У CUDA тело _2d — cudaMemcpy2D тех же строк,
- * тело _n — тот же memcpy пачкой и один synchronize. Другой семантики нет.
- * На RPC пустой слот значит N команд вместо одной. Добавляем слот позже.
- *
- * Выравнивание.
- * Блок буфера кратен странице. Страница — 0x1000 байт. База блока тоже
- * кратна странице. Меньше страницы буфер не выделяем.
- * Смещение тензора внутри блока кратно выравниванию тензора, в байтах.
- * Канон CUDA — 128 байт. OpenCL сообщает CL_DEVICE_MEM_BASE_ADDR_ALIGN
- * в битах; в байты переводим делением на 8. Размер, который alloc_size
- * отдаёт под тензор, кратен тому же выравниванию.
- * Строка пачки _2d или _n, если её можно взять отдельно одним set_tensor
- * или get_tensor, начинается на том же выравнивании. Шаг stride_tensor
- * кратен ему. Размер одной строки странице не обязан: страница — у блока.
 
- *
- * Пары в исходнике стоят рядом: alloc/free, set/get, memset/clear, init/reset.
- * cpy_tensor пары не имеет: это второй описатель, не вторая копия байт.
- *
- * Веса — константы, один set на блок.
- * KV — не константы, строки меняются. Кэш — кольцо строк.
- * Range — непрерывный кусок кольца. Его подгрузка в GPU — set/get этого куска,
- * не копирование всего кэша.
- * Каждая строка кольца начинается на выравнивании тензора, шаг кратен ему.
- * Тогда любой range сам начинается выровненно и годится как вектор.
- *
- * RPC, когда разогнуто. Метода одна на set, get и cpy.
- * Это сквозной ход MCP: compute graph несёт docID, не байты.
- * CoW и RANGE живут на этой смене. По сети уходит описатель и границы range,
- * сам тензор едет отложенно.
- * Когда копировать всё же надо, протокол сменяется на io_uring и Zero-Copy прямо в GPU.
- * Если этот тензор в том GPU уже есть — dedup, передача не начинается.
- * Локальный кэш может жить в памяти, а может в таблицах ZFS.
- * Дескриптор в таблице создаётся до прихода данных и до копирования по сети.
- * Это сквозная концепция netd, не придумка этого файла.
- * Там же: Zero-Copy ядра, ZFS и другие FS с CoW и Dedup;
- * строка JSON не копируется, узел снимается через json_free_antistatic.
- * HTTP REST, два механизма.
- * 100-continue — переход на mmap: тело не буферизуем, дальше страница файла.
- * 101 — смена протокола: документы и тензоры по docID и cname.
- */
 
-static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
-    /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
-    /* .get_base        = */ ggml_backend_opencl_buffer_get_base,
-    /* .init_tensor     = */ ggml_backend_opencl_buffer_init_tensor,
-    /* .memset_tensor   = */ ggml_backend_opencl_buffer_memset,
-    /* .set_tensor      = */ ggml_backend_opencl_buffer_set_tensor,
-    /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
-    /* .cpy_tensor      = */ NULL,
-    /* .clear           = */ ggml_backend_opencl_buffer_clear,
-    /* .reset           = */ ggml_backend_opencl_buffer_reset,
-};
+
+
+
+
+
+
+
+
+
+
+
 
 //
 // buffer type
@@ -2572,34 +2526,6 @@ static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer
     return "OpenCL";
 
     GGML_UNUSED(buffer_type);
-}
-/*
-Функиця вызывается несколько раз для каждого типа буфера (сегмента), например:
-model   4955 MB = может быть разбит на несколько буферов
-KV cache 224 MB -- размер зависит от окна контекста (4096), при окна удвоении удваивается размер кэша
-Compute  304 MB -- размер зависит от окна контекста, при удвоении 492 (размер увеличивается почти линейно) 
-*/
-static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
-    ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(buffer_type->device);
-
-    // clCreateBuffer returns -61 for size 0
-    size = std::max(size, (size_t)0x1000);
-
-    char buf[128];
-    sprintf(buf, "ALLOC_BUF %.2f MB", size / 1024.0 / 1024.0);// выделяется буфер три сегмента: под константы - матрицы, переменные и kv-кеш. 
-    puts(buf);
-    GGML_LOG_INFO("qnn_ocl block alloc %.2f MB live=%ld\n", size / 1024.0 / 1024.0, (long) g_qnn_cl_blocks.load());
-    cl_int err;
-
-    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
-    if (err != CL_SUCCESS) {
-        GGML_LOG_INFO("%s: failed to allocate %.2f MiB\n", __func__, size / 1024.0 / 1024.0);
-        return nullptr;
-    }
-
-    ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
-
-    return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_alignment(ggml_backend_buffer_type_t buffer_type) {
