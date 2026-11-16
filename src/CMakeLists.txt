@@ -66,6 +66,7 @@ set(GGML_OPENCL_KERNELS
     ggml-opencl_transpose_32
     ggml-opencl_transpose_32_16
     ggml-opencl_im2col
+    set_rows
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})

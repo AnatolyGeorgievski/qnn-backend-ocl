@@ -43,6 +43,68 @@
 
 #define UNUSED(x) (void)(x)
 
+/* Счётчик блоков cl_mem. Копия через пустой cpy_tensor гоняет лишние буферы;
+ * живой счётчик это показывает. Подробный лог: GGML_OCL_BLOCK_LEDGER=1. */
+static std::atomic<long> g_qnn_cl_blocks{0};
+
+static bool qnn_block_ledger() {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = std::getenv("GGML_OCL_BLOCK_LEDGER");
+        on = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return on != 0;
+}
+
+static void qnn_block_note(const char * op, long live, size_t bytes) {
+    if (!qnn_block_ledger()) {
+        return;
+    }
+    GGML_LOG_INFO("qnn_ocl block %s live=%ld bytes=%zu\n", op, live, bytes);
+}
+
+static cl_mem qnn_clCreateBuffer(cl_context context, cl_mem_flags flags, size_t size, void * host, cl_int * err) {
+    cl_mem mem = clCreateBuffer(context, flags, size, host, err);
+    if (mem) {
+        long live = g_qnn_cl_blocks.fetch_add(1) + 1;
+        qnn_block_note("create", live, size);
+    }
+    return mem;
+}
+
+static cl_mem qnn_clCreateSubBuffer(cl_mem buffer, cl_mem_flags flags, cl_buffer_create_type type, const void * info, cl_int * err) {
+    cl_mem mem = clCreateSubBuffer(buffer, flags, type, info, err);
+    if (mem) {
+        long live = g_qnn_cl_blocks.fetch_add(1) + 1;
+        qnn_block_note("sub", live, 0);
+    }
+    return mem;
+}
+
+static cl_mem qnn_clCreateImage(cl_context context, cl_mem_flags flags, const cl_image_format * fmt, const cl_image_desc * desc, void * host, cl_int * err) {
+    cl_mem mem = clCreateImage(context, flags, fmt, desc, host, err);
+    if (mem) {
+        long live = g_qnn_cl_blocks.fetch_add(1) + 1;
+        qnn_block_note("image", live, 0);
+    }
+    return mem;
+}
+
+static cl_int qnn_clReleaseMemObject(cl_mem mem) {
+    cl_int err = clReleaseMemObject(mem);
+    if (err == CL_SUCCESS && mem) {
+        long live = g_qnn_cl_blocks.fetch_sub(1) - 1;
+        qnn_block_note("release", live, 0);
+    }
+    return err;
+}
+
+#define clCreateBuffer    qnn_clCreateBuffer
+#define clCreateSubBuffer qnn_clCreateSubBuffer
+#define clCreateImage     qnn_clCreateImage
+#define clReleaseMemObject qnn_clReleaseMemObject
+
+
 #define CL_CHECK(err)                                               \
     do {                                                            \
         cl_int err_ = (err);                                        \
@@ -279,6 +341,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mv;  // собраны базовые подпрограммы для умножения и деквантизации матриц
     cl_program program_la;  // собраны базовые подпрограммы линейной алгебры (blas)
     cl_program program_im2col;
+    cl_program program_set_rows;
 // Универсальные ядра
     std::map<enum ggml_unary_op,cl_kernel> kernel_unary;
     std::map<enum ggml_unary_op,cl_kernel> kernel_unary_f16;
@@ -307,6 +370,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_clamp;
     cl_kernel kernel_norm;
     cl_kernel kernel_rms_norm, kernel_rms_norm_mul;
+    cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32;
+    cl_kernel kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
     cl_kernel kernel_soft_max;
     cl_kernel kernel_soft_max_f16; // f16 по второму аргументу
@@ -753,8 +818,10 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     cl_uint address_bits=0;
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_ADDRESS_BITS, sizeof(cl_uint), &address_bits, NULL));
     GGML_LOG_INFO("ggml_opencl: address bits: %u\n", address_bits);
-    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &backend_ctx->alignment, NULL));
-    GGML_LOG_INFO("ggml_opencl: mem base addr align: %u\n", backend_ctx->alignment);
+    cl_uint base_align_in_bits = 0;
+    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MEM_BASE_ADDR_ALIGN, sizeof(cl_uint), &base_align_in_bits, NULL));
+    backend_ctx->alignment = (cl_int) (base_align_in_bits / 8u);
+    GGML_LOG_INFO("ggml_opencl: mem base addr align: %u bits, %d bytes\n", base_align_in_bits, backend_ctx->alignment);
 
     CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &backend_ctx->max_alloc_size, NULL));
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n", backend_ctx->max_alloc_size/1024/1024);
@@ -999,6 +1066,20 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
     CL_CHECK((backend_ctx->kernel_im2col_f32 = clCreateKernel(backend_ctx->program_im2col, "kernel_im2col_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_im2col_f16 = clCreateKernel(backend_ctx->program_im2col, "kernel_im2col_f16", &err), err));
+
+    // SET_ROWS: F32-строки по индексам I32/I64 в F32 или F16. Так пишется строка KV.
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src_set_rows {
+        #include "set_rows.cl.h"
+    };
+#else
+    const std::string kernel_src_set_rows = read_file("set_rows.cl");
+#endif
+    backend_ctx->program_set_rows = build_program_from_source(context, device, kernel_src_set_rows.c_str(), compile_opts);
+    CL_CHECK((backend_ctx->kernel_set_rows_f32_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i64", &err), err));
+    CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
+    CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
+    CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
 
     // Kernels for Adreno
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -1355,6 +1436,22 @@ static cl_long _event_measure(cl_event evt, int64_t &delay_ns, int64_t &duration
     duration = end - start; // время на исполнение
     return duration;
 }
+static void qnn_ensure_extra(ggml_tensor * t) {
+    if (t == nullptr || t->extra != nullptr) {
+        return;
+    }
+    if (t->view_src != nullptr) {
+        qnn_ensure_extra(t->view_src);
+    }
+    if (t->buffer == nullptr || t->buffer->iface.init_tensor == nullptr) {
+        return;
+    }
+    if (t->data == nullptr && t->view_src == nullptr) {
+        return;
+    }
+    t->buffer->iface.init_tensor(t->buffer, t);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
 
 static int once = 0;
@@ -1369,8 +1466,16 @@ if (!once){
     uint64_t total_min=__LONG_LONG_MAX__;
     uint64_t total_max=0;
 
+    // Очередь вне порядка. Загрузки лежат на описателях буфера, у узлов графа свои.
+    // Дождаться их, иначе первое ядро читает буфер раньше записи.
+    CL_CHECK(clFinish(backend_ctx->queue));
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        qnn_ensure_extra(node);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            qnn_ensure_extra(node->src[s]);
+        }
 if (0) {// optimizations
         if (i+3<cgraph->n_nodes)
             if (node->op==GGML_OP_MUL_MAT && cgraph->nodes[i+1]->op==GGML_OP_UNARY && cgraph->nodes[i+2]->op==GGML_OP_MUL_MAT && cgraph->nodes[i+3]->op==GGML_OP_MUL
@@ -1630,6 +1735,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
             }
             return true;
+        case GGML_OP_SET_ROWS:
+            if (op->src[0]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (op->src[1]->type != GGML_TYPE_I64 && op->src[1]->type != GGML_TYPE_I32) {
+                return false;
+            }
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
@@ -1840,6 +1953,7 @@ struct ggml_backend_opencl_buffer_context {
         for (ggml_tensor_extra_cl_q4_0 * e : temp_tensor_extras_q4_0_in_use) {
             delete e;
         }
+        GGML_LOG_INFO("qnn_ocl block buffer freed live=%ld\n", (long) g_qnn_cl_blocks.load());
     }
 
     ggml_tensor_extra_cl * ggml_opencl_alloc_temp_tensor_extra() {
@@ -2372,6 +2486,72 @@ static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
     ctx->reset();
 }
 
+/* Контракт слотов буфера. Таблица пассивная: слот сам ничего не делает,
+ * тело даёт сторона, которая держит память устройства.
+ * Пустой слот значит «этого шага нет», зовущий идёт запасным путём.
+ *
+ * free_buffer    — отпускает буфер и память устройства. После вызова указатель буфера мёртв.
+ * get_base       — возвращает базовый адрес, от которого считаются смещения тензоров.
+ * init_tensor    — сажает тензор в буфер и собирает его описатель на этой стороне.
+ * memset_tensor  — заполняет кусок тензора одним байтом. Пустой слот: заполнения нет.
+ * set_tensor     — кладёт range в тензор. В разогнутом RPC это тот же протокол, что у cpy.
+ * get_tensor     — забирает range из тензора. Тот же протокол, что у set и cpy.
+ * cpy_tensor     — второй тензор на данные первого.
+ *                  Веса — константы, как строки JSON: ссылка на исходный блок,
+ *                  при разборе строку не копируем и при клоне узла тоже.
+ *                  Байты копируем только когда данным надо разойтись.
+ *                  Ради второго описателя на том же массиве GPU на хост не выгружаем.
+ *                  Пустой слот у чужого зовущего — get, затем set: это как раз пустая выгрузка.
+ * clear          — заполняет весь буфер одним байтом.
+ * reset          — возвращает занятые описатели тензоров в свободный список.
+ *                  Пустой слот: возвращать нечего. У CUDA слот пустой. Аллокатор графа
+ *                  зовёт reset перед раскладкой и при пустом слоте сразу идёт дальше.
+ *
+ * set_tensor_2d, get_tensor_2d, set_tensor_n, get_tensor_n, cpy_tensor_n
+ * в канон не входят. Проверено по зовущему ggml_backend_tensor_set_2d / set_n /
+ * get_2d / get_n / copy_n: пустой слот — тот же результат циклом set_tensor,
+ * get_tensor или cpy_tensor. У CUDA тело _2d — cudaMemcpy2D тех же строк,
+ * тело _n — тот же memcpy пачкой и один synchronize. Другой семантики нет.
+ * На RPC пустой слот значит N команд вместо одной. Добавляем слот позже.
+ *
+ * Выравнивание.
+ * Блок буфера кратен странице. Страница — 0x1000 байт. База блока тоже
+ * кратна странице. Меньше страницы буфер не выделяем.
+ * Смещение тензора внутри блока кратно выравниванию тензора, в байтах.
+ * Канон CUDA — 128 байт. OpenCL сообщает CL_DEVICE_MEM_BASE_ADDR_ALIGN
+ * в битах; в байты переводим делением на 8. Размер, который alloc_size
+ * отдаёт под тензор, кратен тому же выравниванию.
+ * Строка пачки _2d или _n, если её можно взять отдельно одним set_tensor
+ * или get_tensor, начинается на том же выравнивании. Шаг stride_tensor
+ * кратен ему. Размер одной строки странице не обязан: страница — у блока.
+
+ *
+ * Пары в исходнике стоят рядом: alloc/free, set/get, memset/clear, init/reset.
+ * cpy_tensor пары не имеет: это второй описатель, не вторая копия байт.
+ *
+ * Веса — константы, один set на блок.
+ * KV — не константы, строки меняются. Кэш — кольцо строк.
+ * Range — непрерывный кусок кольца. Его подгрузка в GPU — set/get этого куска,
+ * не копирование всего кэша.
+ * Каждая строка кольца начинается на выравнивании тензора, шаг кратен ему.
+ * Тогда любой range сам начинается выровненно и годится как вектор.
+ *
+ * RPC, когда разогнуто. Метода одна на set, get и cpy.
+ * Это сквозной ход MCP: compute graph несёт docID, не байты.
+ * CoW и RANGE живут на этой смене. По сети уходит описатель и границы range,
+ * сам тензор едет отложенно.
+ * Когда копировать всё же надо, протокол сменяется на io_uring и Zero-Copy прямо в GPU.
+ * Если этот тензор в том GPU уже есть — dedup, передача не начинается.
+ * Локальный кэш может жить в памяти, а может в таблицах ZFS.
+ * Дескриптор в таблице создаётся до прихода данных и до копирования по сети.
+ * Это сквозная концепция netd, не придумка этого файла.
+ * Там же: Zero-Copy ядра, ZFS и другие FS с CoW и Dedup;
+ * строка JSON не копируется, узел снимается через json_free_antistatic.
+ * HTTP REST, два механизма.
+ * 100-continue — переход на mmap: тело не буферизуем, дальше страница файла.
+ * 101 — смена протокола: документы и тензоры по docID и cname.
+ */
+
 static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_opencl_buffer_get_base,
@@ -2408,6 +2588,7 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     char buf[128];
     sprintf(buf, "ALLOC_BUF %.2f MB", size / 1024.0 / 1024.0);// выделяется буфер три сегмента: под константы - матрицы, переменные и kv-кеш. 
     puts(buf);
+    GGML_LOG_INFO("qnn_ocl block alloc %.2f MB live=%ld\n", size / 1024.0 / 1024.0, (long) g_qnn_cl_blocks.load());
     cl_int err;
 
     cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
@@ -2965,7 +3146,7 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
     cl_event event_list[GGML_MAX_SRC];
     cl_int event_list_len = _event_list(dst, event_list);
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 
 #if defined(_TEST) && _TEST>0
         ggml_tensor * op = dst;
@@ -2992,6 +3173,106 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clReleaseMemObject(B_d));
     CL_CHECK(clReleaseMemObject(C_d));
 
+}
+
+
+static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(src1);
+    GGML_ASSERT(src1->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    const int ne01 = src0->ne[1];
+    const int ne02 = src0->ne[2];
+    const int ne03 = src0->ne[3];
+    if (ne01 == 0 || ne02 == 0 || ne03 == 0 || src0->ne[0] == 0 || dst->ne[1] == 0) {
+        return;
+    }
+
+    const cl_ulong nb01 = src0->nb[1];
+    const cl_ulong nb02 = src0->nb[2];
+    const cl_ulong nb03 = src0->nb[3];
+
+    const int ne11 = src1->ne[1];
+    const int ne12 = src1->ne[2];
+    GGML_ASSERT(ne11 > 0 && ne12 > 0);
+
+    const cl_ulong nb10 = src1->nb[0];
+    const cl_ulong nb11 = src1->nb[1];
+    const cl_ulong nb12 = src1->nb[2];
+
+    const int ne0 = dst->ne[0];
+    const cl_ulong nb1 = dst->nb[1];
+    const cl_ulong nb2 = dst->nb[2];
+    const cl_ulong nb3 = dst->nb[3];
+
+    const int nblk0 = ne0 / ggml_blck_size(dst->type);
+    GGML_ASSERT(nblk0 > 0);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    cl_command_queue queue = backend_ctx->queue;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong offset0 = extra0->offset + src0->view_offs;
+    cl_ulong offset1 = extra1->offset + src1->view_offs;
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    cl_kernel kernel = nullptr;
+    if (dst->type == GGML_TYPE_F32) {
+        kernel = src1->type == GGML_TYPE_I64 ? backend_ctx->kernel_set_rows_f32_i64 : backend_ctx->kernel_set_rows_f32_i32;
+    } else if (dst->type == GGML_TYPE_F16) {
+        kernel = src1->type == GGML_TYPE_I64 ? backend_ctx->kernel_set_rows_f16_i64 : backend_ctx->kernel_set_rows_f16_i32;
+    }
+    GGML_ASSERT(kernel != nullptr);
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb10));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &nblk0));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb3));
+
+    int nth0 = backend_ctx->gpu_family == INTEL ? 32 : 64;
+    size_t max_workgroup_size = 0;
+    CL_CHECK(clGetKernelWorkGroupInfo(kernel, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &max_workgroup_size, NULL));
+    while ((size_t)nth0 < (size_t)nblk0 && (size_t)nth0 < max_workgroup_size) {
+        nth0 *= 2;
+    }
+    int rows_per_workgroup = 1;
+    if (nth0 > nblk0) {
+        rows_per_workgroup = nth0 / nblk0;
+        nth0 = nblk0;
+    }
+
+    size_t global_work_size[] = {
+        (size_t)(ne01 + rows_per_workgroup - 1) / rows_per_workgroup * nth0,
+        (size_t)ne02 * rows_per_workgroup,
+        (size_t)ne03};
+    size_t local_work_size[] = {(size_t)nth0, (size_t)rows_per_workgroup, 1};
+
+    cl_event event_list[GGML_MAX_SRC];
+    cl_int event_list_len = _event_list(dst, event_list);
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 }
 
 static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -3101,7 +3382,7 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
         CL_CHECK(SuggestedLocalWorkSize(queue, kernel, 3, NULL, global_work_size, local_work_size)); 
         cl_event event_list[GGML_MAX_SRC];
         cl_uint  event_list_len = _event_list(dst, event_list);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -3114,7 +3395,7 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
         cl_event event_list[GGML_MAX_SRC];
         cl_uint  event_list_len = _event_list(dst, event_list);
 
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -3180,7 +3461,7 @@ static void ggml_cl_gga(ggml_backend_t backend, const ggml_tensor * src0, const 
     cl_uint  event_list_len = 0;//_event_list(dst, event_list);
     event_list_len += _event_get(src0->src[0], event_list+event_list_len);
     event_list_len += _event_get(src1->src[0], event_list+event_list_len);
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -3316,7 +3597,7 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
         CL_CHECK(SuggestedLocalWorkSize(queue, kernel,3,NULL, global_work_size, local_work_size));// можно договориться
         cl_event event_list[GGML_MAX_SRC];
         cl_uint  event_list_len = _event_list(dst, event_list);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -3332,7 +3613,7 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
         cl_event event_list[GGML_MAX_SRC];
         cl_uint  event_list_len = _event_list(dst, event_list);
 
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -3371,7 +3652,7 @@ static void _cl_unary_op(ggml_backend_opencl_context* backend_ctx, const ggml_te
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt);
+    clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt);
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3467,7 +3748,7 @@ static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const
     cl_event event_list[GGML_MAX_SRC];
     cl_uint  event_list_len = _event_list(dst, event_list);
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt);
+    clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt);
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3515,7 +3796,7 @@ static void ggml_cl_silu(ggml_backend_t backend, const ggml_tensor * src0, const
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3561,7 +3842,7 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3603,7 +3884,7 @@ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, cons
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3653,7 +3934,7 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -3764,8 +4045,12 @@ static cl_mem _get_cl_buffer_row(const ggml_tensor * tensor, int row, cl_mem_fla
 
 static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
     GGML_ASSERT(dst);
+    // Ноль строк или ноль длины: CPU не входит в циклы, деления на ne00 нет.
+    if (src0->ne[0] == 0 || ggml_nrows(src0) == 0) {
+        return;
+    }
+    GGML_ASSERT(src0->extra);
     GGML_ASSERT(dst->extra);
 
     UNUSED(src1);
@@ -3816,7 +4101,7 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
@@ -3874,7 +4159,7 @@ static void ggml_cl_rms_norm_mul(ggml_backend_t backend, const ggml_tensor * src
     event_list_len+= _event_get(src1, event_list+event_list_len);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;// добыть событие, сделать метод
-    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -4006,7 +4291,7 @@ GGML_ASSERT(ne03==1);
     event_list_len+= _event_get(src1, event_list+event_list_len);
     event_list_len+= _event_get(src2, event_list+event_list_len);
 
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -4089,7 +4374,7 @@ static void ggml_cl_ffn         (ggml_backend_t backend, const ggml_tensor * src
 
     cl_command_queue queue = backend_ctx->queue;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -5060,7 +5345,7 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         cl_event event_list[GGML_MAX_SRC];
         cl_uint event_list_len = _event_list(dst, event_list);
 
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, src0, src1);
@@ -5073,7 +5358,7 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 
         cl_event event_list[GGML_MAX_SRC];
         cl_uint  event_list_len = _event_list(dst, event_list);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
         g_profiling_info.emplace_back();
         populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, src0, src1);
@@ -5116,7 +5401,7 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
     cl_uint  event_list_len = _event_list(dst, event_list);
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src0);
@@ -5245,7 +5530,7 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     cl_uint  event_list_len = 0;
     event_list_len += _event_get(src0, event_list);// добавить одно событие
 //    event_list_len += _event_get(src1, event_list);// добавить одно событие
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extra1->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extra1->evt));
 
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
@@ -5430,7 +5715,7 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_event event_list[GGML_MAX_SRC];
     cl_uint  event_list_len = _event_list(dst, event_list);
 
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
@@ -5606,7 +5891,7 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     cl_event event_list[GGML_MAX_SRC];
     cl_uint  event_list_len = _event_list(dst, event_list);
 
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list, &extrad->evt));
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
 #ifdef GGML_OPENCL_PROFILING
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
@@ -5640,6 +5925,15 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
                 return false;
             }
             func = ggml_cl_get_rows;
+            break;
+        case GGML_OP_SET_ROWS:
+            if (tensor->src[0]->ne[0] == 0 || tensor->src[0]->ne[1] == 0 || tensor->ne[1] == 0) {
+                return true;
+            }
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_set_rows;
             break;
         case GGML_OP_CPY:
             if (!any_on_device) {
@@ -5738,6 +6032,9 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
             func = ggml_cl_norm;
             break;
         case GGML_OP_RMS_NORM:
+            if (tensor->ne[0] == 0 || ggml_nrows(tensor) == 0) {
+                return true;
+            }
             if (!any_on_device) {
                 return false;
             }
