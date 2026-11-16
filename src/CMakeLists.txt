@@ -67,6 +67,10 @@ set(GGML_OPENCL_KERNELS
     ggml-opencl_transpose_32_16
     ggml-opencl_im2col
     set_rows
+    flash_attn_f16
+    flash_attn_f32
+    flash_attn_f32_f16
+    glu
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})
