@@ -1433,6 +1433,14 @@ static void ggml_backend_opencl_free(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 /* Запись не ждёт. Готовность — extra->evt. offset — байты от начала тензора, не от базы буфера. */
+static bool qnn_rect_pitch_ok(size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+static bool qnn_repacked(enum ggml_type type);
+
+static void ggml_backend_opencl_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+static void ggml_backend_opencl_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+
 static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -1447,6 +1455,64 @@ static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_te
 
 printf("ASYNC SET %s\n", tensor->name);
 }
+
+static void ggml_backend_opencl_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies == 0 || size == 0) {
+        return;
+    }
+    if (qnn_repacked(tensor->type) || !qnn_rect_pitch_ok(size, n_copies, stride_tensor, stride_data)) {
+        for (size_t i = 0; i < n_copies; i++) {
+            ggml_backend_opencl_set_tensor_async(backend, tensor,
+                (const char *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    GGML_ASSERT(extra);
+    const size_t buf_origin[3] = { (size_t) extra->offset + tensor->view_offs + offset, 0, 0 };
+    const size_t host_origin[3] = { 0, 0, 0 };
+    const size_t region[3] = { size, n_copies, 1 };
+    cl_event prev = extra->evt;
+    CL_CHECK(clEnqueueWriteBufferRect(
+        backend_ctx->queue, extra->data_device, CL_NON_BLOCKING,
+        buf_origin, host_origin, region,
+        stride_tensor, 0, stride_data, 0,
+        data, prev ? 1 : 0, prev ? &prev : NULL, &extra->evt));
+    if (prev) {
+        CL_CHECK(clReleaseEvent(prev));
+    }
+}
+
+static void ggml_backend_opencl_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies == 0 || size == 0) {
+        return;
+    }
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    GGML_ASSERT(extra);
+    if (qnn_repacked(tensor->type) || !qnn_rect_pitch_ok(size, n_copies, stride_tensor, stride_data)) {
+        for (size_t i = 0; i < n_copies; i++) {
+            CL_CHECK(clEnqueueReadBuffer(
+                backend_ctx->queue, extra->data_device, CL_NON_BLOCKING,
+                extra->offset + tensor->view_offs + offset + i * stride_tensor,
+                size, (char *) data + i * stride_data,
+                extra->evt ? 1 : 0, extra->evt ? &extra->evt : NULL, NULL));
+        }
+        return;
+    }
+    const size_t buf_origin[3] = { (size_t) extra->offset + tensor->view_offs + offset, 0, 0 };
+    const size_t host_origin[3] = { 0, 0, 0 };
+    const size_t region[3] = { size, n_copies, 1 };
+    CL_CHECK(clEnqueueReadBufferRect(
+        backend_ctx->queue, extra->data_device, CL_NON_BLOCKING,
+        buf_origin, host_origin, region,
+        stride_tensor, 0, stride_data, 0,
+        data, extra->evt ? 1 : 0, extra->evt ? &extra->evt : NULL, NULL));
+}
+
 static void ggml_backend_opencl_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_UNUSED(backend);
     GGML_UNUSED(tensor);
@@ -1964,8 +2030,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
-        case GGML_OP_DIAG_MASK_INF:
-            return op->ne[3] == 1;
+        // GGML_OP_DIAG_MASK_INF снят в llama.cpp 10.0.1. Маска живёт во flash.
         case GGML_OP_ROPE: {
             const int mode = ((const int32_t *) op->op_params)[2];
             if (mode & GGML_ROPE_TYPE_MROPE) {
@@ -2014,6 +2079,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
     /* .free                    = */ ggml_backend_opencl_free,
     /* .set_tensor_async        = */ ggml_backend_opencl_set_tensor_async,  /* ggml_backend_opencl_set_tensor_async */
     /* .get_tensor_async        = */ NULL,  /* ggml_backend_opencl_get_tensor_async */
+    /* .set_tensor_2d_async     = */ ggml_backend_opencl_set_tensor_2d_async,
+    /* .get_tensor_2d_async     = */ ggml_backend_opencl_get_tensor_2d_async,
     /* .cpy_tensor_async        = */ NULL,  /* ggml_backend_opencl_cpy_tensor_async */
     /* .synchronize             = */ ggml_backend_opencl_synchronize,  /* ggml_backend_opencl_synchronize */
     /* .graph_plan_create       = */ NULL,
@@ -2200,6 +2267,149 @@ static bool ggml_backend_opencl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, 
     return true;
 }
 
+// Прямоугольник: n одинаковых кусков, шаг по устройству и по хосту.
+// Шаг короче куска OpenCL не принимает — тогда вызывающий идёт циклом set/get.
+static bool qnn_rect_pitch_ok(size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    return n_copies > 0 && size > 0 && stride_tensor >= size && stride_data >= size;
+}
+
+static bool qnn_repacked(enum ggml_type type) {
+    return type == GGML_TYPE_Q4_0;
+}
+
+static void ggml_backend_opencl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies == 0 || size == 0) {
+        return;
+    }
+    if (qnn_repacked(tensor->type) || !qnn_rect_pitch_ok(size, n_copies, stride_tensor, stride_data)) {
+        for (size_t i = 0; i < n_copies; i++) {
+            ggml_backend_opencl_buffer_set_tensor(buffer, tensor,
+                (const char *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
+    GGML_ASSERT(tensor->extra);
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    const size_t buf_origin[3] = { (size_t) extra->offset + tensor->view_offs + offset, 0, 0 };
+    const size_t host_origin[3] = { 0, 0, 0 };
+    const size_t region[3] = { size, n_copies, 1 };
+    cl_event prev = extra->evt;
+    CL_CHECK(clEnqueueWriteBufferRect(
+        backend_ctx->queue, extra->data_device, CL_NON_BLOCKING,
+        buf_origin, host_origin, region,
+        stride_tensor, 0, stride_data, 0,
+        data, prev ? 1 : 0, prev ? &prev : NULL, &extra->evt));
+    if (prev) {
+        CL_CHECK(clReleaseEvent(prev));
+    }
+    CL_CHECK(clWaitForEvents(1, &extra->evt));
+}
+
+static void ggml_backend_opencl_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (n_copies == 0 || size == 0) {
+        return;
+    }
+    if (qnn_repacked(tensor->type) || !qnn_rect_pitch_ok(size, n_copies, stride_tensor, stride_data)) {
+        for (size_t i = 0; i < n_copies; i++) {
+            ggml_backend_opencl_buffer_get_tensor(buffer, tensor,
+                (char *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
+    GGML_ASSERT(tensor->extra);
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    if (extra->evt == nullptr) {
+        CL_CHECK(clFinish(backend_ctx->queue));
+    }
+    const size_t buf_origin[3] = { (size_t) extra->offset + tensor->view_offs + offset, 0, 0 };
+    const size_t host_origin[3] = { 0, 0, 0 };
+    const size_t region[3] = { size, n_copies, 1 };
+    CL_CHECK(clEnqueueReadBufferRect(
+        backend_ctx->queue, extra->data_device, CL_BLOCKING,
+        buf_origin, host_origin, region,
+        stride_tensor, 0, stride_data, 0,
+        data, extra->evt ? 1 : 0, extra->evt ? &extra->evt : NULL, NULL));
+}
+
+static void ggml_backend_opencl_buffer_set_tensor_n(ggml_backend_buffer_t buffer, ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] == 0 || !qnn_repacked(tensors[i]->type)) {
+            continue;
+        }
+        ggml_backend_opencl_buffer_set_tensor(buffer, tensors[i], data[i], offsets[i], sizes[i]);
+    }
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    cl_command_queue queue = backend_ctx->queue;
+    bool queued = false;
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] == 0 || qnn_repacked(tensors[i]->type)) {
+            continue;
+        }
+        GGML_ASSERT(tensors[i]->extra);
+        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensors[i]->extra;
+        cl_event prev = extra->evt;
+        CL_CHECK(clEnqueueWriteBuffer(
+            queue, extra->data_device, CL_NON_BLOCKING, extra->offset + tensors[i]->view_offs + offsets[i],
+            sizes[i], data[i], prev ? 1 : 0, prev ? &prev : NULL, &extra->evt));
+        if (prev) {
+            CL_CHECK(clReleaseEvent(prev));
+        }
+        queued = true;
+    }
+    if (queued) {
+        CL_CHECK(clFinish(queue));
+    }
+}
+
+static void ggml_backend_opencl_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] == 0 || !qnn_repacked(tensors[i]->type)) {
+            continue;
+        }
+        ggml_backend_opencl_buffer_get_tensor(buffer, tensors[i], data[i], offsets[i], sizes[i]);
+    }
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer->buft->device);
+    cl_command_queue queue = backend_ctx->queue;
+    std::vector<cl_event> evts;
+    evts.reserve(n_tensors);
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (sizes[i] == 0 || qnn_repacked(tensors[i]->type)) {
+            continue;
+        }
+        GGML_ASSERT(tensors[i]->extra);
+        ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensors[i]->extra;
+        cl_event evt = nullptr;
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, extra->data_device, CL_NON_BLOCKING,
+            extra->offset + tensors[i]->view_offs + offsets[i],
+            sizes[i], data[i], extra->evt ? 1 : 0, extra->evt ? &extra->evt : NULL, &evt));
+        evts.push_back(evt);
+    }
+    if (!evts.empty()) {
+        CL_CHECK(clWaitForEvents((cl_uint) evts.size(), evts.data()));
+        for (cl_event evt : evts) {
+            CL_CHECK(clReleaseEvent(evt));
+        }
+    }
+}
+
+static bool ggml_backend_opencl_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, const ggml_tensor * const * srcs, ggml_tensor * const * dsts, size_t n_tensors) {
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (!ggml_backend_opencl_buffer_cpy_tensor(buffer, srcs[i], dsts[i])) {
+            return false;
+        }
+    }
+    if (n_tensors > 0 && dsts[0] && dsts[0]->buffer) {
+        ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dsts[0]->buffer->buft->device);
+        CL_CHECK(clFinish(backend_ctx->queue));
+    }
+    return true;
+}
+
 static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_opencl_buffer_get_base,
@@ -2207,9 +2417,14 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_opencl_buffer_memset,
     /* .set_tensor      = */ ggml_backend_opencl_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_opencl_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_opencl_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ ggml_backend_opencl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
+    /* .set_tensor_n    = */ ggml_backend_opencl_buffer_set_tensor_n,
+    /* .get_tensor_n    = */ ggml_backend_opencl_buffer_get_tensor_n,
+    /* .cpy_tensor_n    = */ ggml_backend_opencl_buffer_cpy_tensor_n,
 };
 
 /* size меньше страницы поднимаю до 0x1000: clCreateBuffer на нуле возвращает -61. */
@@ -2748,10 +2963,12 @@ static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer
 static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_opencl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_opencl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_opencl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_opencl_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ ggml_backend_opencl_buffer_type_get_alloc_size,// (optional) data size needed to allocate the tensor, including padding (defaults to ggml_nbytes)
-    /* .is_host          = */ NULL,// (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
+    /* .get_alloc_size   = */ ggml_backend_opencl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
+    /* .is_host          = */ NULL,
 };
 
 ggml_backend_buffer_type_t ggml_backend_opencl_buffer_type() {
@@ -6299,8 +6516,6 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
             func = ggml_cl_cpy;
             break;
         case GGML_OP_DUP:
-            GGML_ASSERT(0 && "исключить операцию");
-            break;
         case GGML_OP_CONT:
             if (!any_on_device) {
                 return false;
@@ -6418,12 +6633,7 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
             }
             func = ggml_cl_nop;
             break;
-        case GGML_OP_DIAG_MASK_INF:
-            if (!any_on_device) {
-                return false;
-            }
-            func = ggml_cl_diag_mask_inf;
-            break;
+        // GGML_OP_DIAG_MASK_INF снят в llama.cpp 10.0.1.
         case GGML_OP_SOFT_MAX:
             func = ggml_cl_soft_max;
             break;

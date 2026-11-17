@@ -3,6 +3,7 @@
 <tags>
 - src/ggml-opencl.cpp
 - kernels/
+- ChangeLog
 - ir/mcp_ir.h
 - tools/quantize/
 - docs/MCP_IR.md
@@ -55,11 +56,62 @@ path: /home/george/qnn-backend-ocl/README.md
 - Пресеты `opencl-arc` / `opencl-adreno` не смешивать (см. QuantumNN/SAT.md · урок 2).
 - Совместимость: общий Tensor IR + те же ops; LL-HW / ICD-профиль — отдельная половина двери `ADRENO`, не развилка продукта.
 
-## Сервер флота
+## Сборка на llama.cpp 10.0.1
 
-Этот репозиторий не крутится как RPC-сервер. OpenCL флота — llama.cpp `fc504f91d` и патч `qnn-backend-rpc/notes/patches/0002-llama-cpp-10.0.1.patch`, протокол `10.0.1`. Бинарь на phantom: `~/src/llama-cpp-next`, порт `18769`.
+Backend кладётся в дерево llama.cpp поверх патча RPC. База — `fc504f91d`. Патч — `qnn-backend-rpc/notes/patches/0002-llama-cpp-10.0.1.patch`, протокол `10.0.1`. Как наложить патч — в README того репозитория. Заголовок `ggml/include/ggml-opencl.h` остаётся из llama.cpp.
 
-Здесь остаётся тензорный ассемблер, IR и ядра старого `ggml-opencl`. Ими текущий сервер не заменяют. Речь Qwen на сборке 10.0.1 уже совпала с CUDA. Следующая правка устройства пишется патчем в то дерево llama.cpp.
+Каталог `ggml/src/ggml-opencl` после патча заменяется файлами отсюда: `src/CMakeLists.txt`, `src/ggml-opencl.cpp`, каталог `kernels/`.
+
+Пресет `opencl-arc` пишет в `build-opencl-arc`. Эта сборка идёт в отдельный каталог `build-our-ocl`, теми же флагами:
+
+```bash
+OCL=/path/to/qnn-backend-ocl
+DST=ggml/src/ggml-opencl
+rm -rf "$DST"
+mkdir -p "$DST"
+cp "$OCL/src/CMakeLists.txt" "$OCL/src/ggml-opencl.cpp" "$DST/"
+cp -a "$OCL/kernels" "$DST/kernels"
+
+cmake -S . -B build-our-ocl -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_OPENCL=ON \
+  -DGGML_RPC=ON \
+  -DGGML_OPENCL_EMBED_KERNELS=ON \
+  -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
+  -DGGML_OPENCL_SOA_Q=ON \
+  -DGGML_OPENCL_PROFILING=OFF \
+  -DGGML_OPENCL_TARGET_VERSION=300 \
+  -DLLAMA_CURL=OFF
+cmake --build build-our-ocl -j --target llama-cli ggml-rpc-server
+```
+
+Нужны заголовки OpenCL, Ninja и Python 3: ядра вшиваются `kernels/embed_kernel.py`. Ядра Adreno выключены.
+
+Сервер из `build-our-ocl/bin`:
+
+```bash
+NEO_DISABLE_CACHE=1 LD_LIBRARY_PATH=$PWD ./ggml-rpc-server -H 0.0.0.0 -p 18769
+```
+
+Клиент из того же дерева. Версия клиента и сервера — `10.0.1`.
+
+```bash
+LD_LIBRARY_PATH=build-our-ocl/bin ./build-our-ocl/bin/llama-cli \
+  --rpc HOST:18769 -dev RPC0 -ngl 99 \
+  -m model.gguf -p 'Hello' -n 16 --temp 0 -s 1 -c 512 -st
+```
+
+Баннер: `Starting RPC server v10.0.1`. Устройство на прогоне: Intel Arc Pro B60, OpenCL 3.0.
+
+## Что держит эта сборка
+
+Очередь команд идёт в порядке подачи. KV для этого backend — F16, активация остаётся float. На устройстве перекладывается только `Q4_0`. `Q8_0`, `F16` и остальные типы пишутся теми байтами, что пришли с хоста.
+
+17 ноября 2026, Qwen3-8B Q8_0, температура 0, семя 1, текст про прямую речь и benchmark: первая фраза совпала с CUDA 10.0.1. Промпт 66.7 t/s, генерация 33.4 t/s.
+
+Приёмка этой сборки — Qwen и Gemma. Заявка, которую можно показывать: речь Qwen на Arc Pro B60 через этот backend и RPC 10.0.1.
+
+Tensor IR и свой ICD остаются целью репозитория. Граф этой сборки исполняет OpenCL C через Intel ICD. Слоты `get_tensor_async` и `cpy_tensor_async` пустые. Пачка `set_tensor_n` в прогоне речи не вызывалась: вес приходит по одному тензору. `BF16` KV эта сборка не обслуживает: ядра `set_rows` для него нет.
 
 ## Дерево
 
