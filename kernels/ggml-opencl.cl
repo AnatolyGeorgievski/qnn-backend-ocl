@@ -324,7 +324,7 @@ struct block_q5_1
 //------------------------------------------------------------------------------
 // block_q8_0
 //------------------------------------------------------------------------------
-struct block_q8_0
+struct __attribute__((packed)) block_q8_0
 {
     half d;
     int8_t qs[QK8_0];
@@ -741,13 +741,11 @@ kernel void kernel_add_row(
         global float8 * dst,
         uint ne
 ) {
+    // Одна строка src1 повторяется. Индекс — свой у каждой нити: блок подгруппы
+    // длиной 8*subgroup читал вес за краем короткой строки (норма Q, 128).
     uint gid = get_global_id(0);
-    gid = sub_group_broadcast(gid,0);
-    uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
-//    idx1= sub_group_broadcast(idx1,0);
-    float8 a = _sub_group_block_read((global float*)(src0+gid));
-    float8 b = _sub_group_block_read((global float*)(src1+idx1));
-    _sub_group_block_write((global float*)(dst+gid), (a+b));
+    uint idx1 = gid % ne;
+    dst[gid] = src0[gid] + src1[idx1];
 }
 
 REQD_SUBGROUP_SIZE_16
@@ -838,13 +836,12 @@ kernel void kernel_mul_row(
         global float8 * dst,
         uint ne
 ) {
+    // Одна строка src1 повторяется на каждую голову. Нить пишет свои 8 чисел,
+    // вес берёт по gid % ne. Прежний блок подгруппы покрывал 256 чисел и для
+    // веса из 128 читал вторую голову уже за строкой.
     uint gid = get_global_id(0);
-    uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
-    gid = sub_group_broadcast(gid,0);
-    idx1= sub_group_broadcast(idx1,0);
-    float8 a = _sub_group_block_read((global float*)(src0+gid));
-    float8 b = _sub_group_block_read((global float*)(src1+idx1));
-    _sub_group_block_write((global float*)(dst+gid), (a*b));
+    uint idx1 = gid % ne;
+    dst[gid] = src0[gid] * src1[idx1];
 }
 
 //------------------------------------------------------------------------------
@@ -1151,18 +1148,23 @@ kernel void kernel_get_rows_q8_0(
         uint nb1,
         uint nb2
 ) {
-    uint row = get_group_id(0);//*get_local_size(0);// число элементов в строке/размер группы
+    // Сетка по X шире одной группы. Строку пишет группа 0, иначе все пишут поверх.
+    if (get_group_id(0) != 0) {
+        return;
+    }
     uint i11 = get_group_id(1);
-
-    uint r = rows[i11]; //((global int32_t *) ((global char *) src1 + i11*nb11 + i10*nb10))[0];
-
-//    uint i02 = i11;
-    global struct block_q8_0 *blk = (global struct block_q8_0 *)(src0 + mul24(row,nb01));
-
-//    global struct block_q8_0 * blk = (global struct block_q8_0 *) ((global char *) src0 + r*nb01 + i02*nb02);
-    global float *y = (global float *) ((global char *) dst + mul24(row,nb1));//i11*nb2 + i10*nb1);
-    for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) 
-        y[i] = dequantize_block_q8_0(blk[i/QK8_0].qs, blk[i/QK8_0].d);
+    uint r = rows[i11];
+    global struct block_q8_0 * blk =
+        (global struct block_q8_0 *) ((global char *) src0 + (ulong) r * nb01);
+    global float * y =
+        (global float *) ((global char *) dst + (ulong) i11 * nb1);
+    uint stride = get_sub_group_size();
+    for (uint i = get_sub_group_local_id(); i < ne00; i += stride) {
+        uint block = i / QK8_0;
+        uint lane  = i % QK8_0;
+        y[i] = ((float) blk[block].qs[lane]) * (float) blk[block].d;
+    }
+    (void) nb02; (void) nb10; (void) nb11; (void) nb2;
 }
 // выделить методы BLAS в отдельный файл
 // L1 BLAS COPY ( Y ← X )
@@ -1457,25 +1459,21 @@ kernel void kernel_rms_norm(
         uint nb01,
         float eps
 ){
+    // Обычный load. Блочное чтение подгруппы требует выравнивания 512 байт,
+    // а строка в compute-буфере начинается не с него. Сумма тогда чужая.
     uint lid = get_local_id(0);
     uint r0  = get_group_id(0);
-    global float4 * x = (global float4 *) ((global char *) src0 + r0*nb01);
-
-    float4 sumf = 0;
-    for (uint i = sub_group_broadcast(lid,0); i < ne00/4; i += get_local_size(0)) {
-        float4 xi =as_float4(intel_sub_group_block_read4((global uint*)(x+i)));
+    global float * x = (global float *) ((global char *) src0 + (ulong) r0 * nb01);
+    float sumf = 0.f;
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = x[i];
         sumf += xi * xi;
     }
-    float all_sum = sumf.s0 + sumf.s1 + sumf.s2 + sumf.s3;
-    all_sum = work_group_reduce_add(all_sum);
-    float mean = all_sum/ne00;
-    float scale = rsqrt(mean + eps);
-
-    global float4 * y = (global float4 *) (dst + r0*ne00);
-    for (uint i = sub_group_broadcast(lid,0); i < ne00/4; i += get_local_size(0)) {
-        float4 xi =as_float4(intel_sub_group_block_read4((global uint*)(x+i)));
-        float4 yi = xi * scale;
-        intel_sub_group_block_write4((global uint*)(y+i), as_uint4(yi));
+    sumf = work_group_reduce_add(sumf);
+    float scale = rsqrt(sumf / (float) ne00 + eps);
+    global float * y = (global float *) (dst + (ulong) r0 * ne00);
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        y[i] = x[i] * scale;
     }
 }
 // Объединяет операцию rms_norm  c пост-операцией mul, нормуль. Операция mul с броадкастом, с повтором строки 
@@ -3767,20 +3765,22 @@ inline float block_q_4_0_dot_y_flat(
 
 inline float block_q_8_0_dot_y(
         global struct block_q8_0 * qb_curr,
-        float* y
+        global float * y
 ) {
-    float4 acc = (0.f);
-    half d = qb_curr->d;
-    #pragma unroll    
-    for (uint i = 0; i < 32/16; i++) 
-    {
-        char16 ql = vload16(i,(global char*)qb_curr->qs);
-        float16 yl = vload16(i, y);
-        #pragma unroll
-        for (uint k = 0; k < 16; k++)
-            acc[k/4] += yl[k]*ql[k];
+    // Вес блока: w = (float)d * (float)qs. int8 и half во float переводятся точно.
+    // Активация уже float, второй раз в int8 её не кладём: это лишняя ошибка 1/127.
+    // Сумма блока — цепочка fma, одно округление на член. Масштаб умножается один раз.
+    // Четыре аккумулятора прячут задержку fma на Xe; сложение хвоста — ещё два округления,
+    // они меньше шага half-масштаба.
+    float4 acc = (float4)(0.f);
+    #pragma unroll
+    for (uint j = 0; j < 8; j++) {
+        float4 y4 = vload4(j, y);
+        char4  q4 = vload4(j, (global char *) qb_curr->qs);
+        acc = fma(convert_float4(q4), y4, acc);
     }
-    return d*(acc.s0+acc.s1+acc.s2+acc.s3);
+    const float sum = acc.s0 + acc.s1 + acc.s2 + acc.s3;
+    return sum * (float) qb_curr->d;
 }
 inline float block_q_4_1_dot_y(
         global struct block_q4_1 * qb_curr,
@@ -4018,11 +4018,13 @@ inline void mul_vec_q8_0_f32(
     global struct block_q8_0 * x = (global struct block_q8_0 *) src0 + offset0;
     global float             * y = (global float             *) src1 + r1*ne10 + im*ne00*ne1;
 
-    const uint stride = get_max_sub_group_size();
+    // Шаг — размер этой подгруппы, не максимум устройства.
+    // Иначе при подгруппе 16 и максимуме 32 блоки 16..23 строки не входят в сумму.
+    const uint stride = get_sub_group_size();
     const uint ix = get_sub_group_local_id();
     float sumf[N_DST]={0.f};
     for (uint ib = ix; ib < nb; ib += stride) {
-        for (uint row = 0; row < N_DST; row++){// все субгруппы одновременно читают y[ib]
+        for (uint row = 0; row < N_DST; row++){
             sumf[row] += block_q_8_0_dot_y(x+ib+row*nb, y+QK8_0*ib);
         }
     }

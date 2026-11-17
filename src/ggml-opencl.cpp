@@ -241,6 +241,7 @@ static cl_int SuggestedLocalWorkSize(cl_command_queue queue, cl_kernel kernel, c
     size_t* suggested_local_work_size)
 {// максимальная загрузка будет достигаться при local work =512 Threads= x16 (max sub group size)
     cl_int max_EU = 512;//=160 для B580 CL_DEVICE_MAX_COMPUTE_UNITS перенести в конфигурацию, должно быть два параметра для выбора: общее число слайсов, кратность k8, k16, k32, k64...
+    const size_t keep = suggested_local_work_size[0];
     size_t max_subgroup_size=suggested_local_work_size[0];
     size_t max_subgroup_count=1;
     size_t max_num_subgroups =1;
@@ -259,6 +260,9 @@ static cl_int SuggestedLocalWorkSize(cl_command_queue queue, cl_kernel kernel, c
 //    suggested_local_work_size[0] = ;
 /*  suggested_local_work_size[1] = max_subgroup_count;
     suggested_local_work_size[2] = max_subgroup_size; */
+    if (suggested_local_work_size[0] == 0 || (global_work_size && global_work_size[0] % suggested_local_work_size[0] != 0)) {
+        suggested_local_work_size[0] = keep ? keep : 1;
+    }
     return 0;
     UNUSED(global_work_offset);
 }
@@ -985,8 +989,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 //        CL_CHECK((backend_ctx->kernel_soft_max_4_f16     = clCreateKernel(backend_ctx->program, "kernel_soft_max_4_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_norm_f16      = clCreateKernel(backend_ctx->program, "kernel_rope_norm_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_neox_f16      = clCreateKernel(backend_ctx->program, "kernel_rope_neox_f16", &err), err));
-    CL_CHECK((backend_ctx->kernel_rope_multi_f16     = clCreateKernel(backend_ctx->program, "kernel_rope_multi_f16", &err), err));
-    CL_CHECK((backend_ctx->kernel_rope_vision_f16    = clCreateKernel(backend_ctx->program, "kernel_rope_vision_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_multi_f16     = clCreateKernel(backend_ctx->program, "kernel_rope_multi_f16", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_vision_f16    = clCreateKernel(backend_ctx->program, "kernel_rope_vision_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_cpy_f16_f16        = clCreateKernel(backend_ctx->program, "kernel_cpy_f16_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows[GGML_TYPE_F16]       = clCreateKernel(backend_ctx->program, "kernel_get_rows_f16", &err), err));
 
@@ -2098,10 +2102,22 @@ struct ggml_backend_opencl_buffer_context {
     }
 
     void reset() {
+        std::vector<ggml_tensor_extra_cl *> keep;
         for (ggml_tensor_extra_cl * e : temp_tensor_extras_in_use) {
-            temp_tensor_extras.push_back(e);
+            bool pinned = false;
+            for (const auto & kv : plain_by_offset) {
+                if (kv.second == e) {
+                    pinned = true;
+                    break;
+                }
+            }
+            if (pinned) {
+                keep.push_back(e);
+            } else {
+                temp_tensor_extras.push_back(e);
+            }
         }
-        temp_tensor_extras_in_use.clear();
+        temp_tensor_extras_in_use.swap(keep);
 
         for (ggml_tensor_extra_cl_q4_0 * e : temp_tensor_extras_q4_0_in_use) {
             temp_tensor_extras_q4_0.push_back(e);
@@ -2143,6 +2159,44 @@ static void                   ggml_backend_opencl_buffer_get_tensor(ggml_backend
 static void                   ggml_backend_opencl_buffer_memset(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 static void                   ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value);
 static void *                 ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer);
+static bool                   ggml_backend_opencl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst);
+
+static bool ggml_backend_opencl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (src == nullptr || dst == nullptr || src->buffer == nullptr || dst->buffer == nullptr) {
+        return false;
+    }
+    if (src->buffer->buft != buffer->buft || dst->buffer->buft != buffer->buft) {
+        return false;
+    }
+    if (ggml_is_quantized(src->type) || src->type != dst->type) {
+        return false;
+    }
+    if (src->extra == nullptr && src->buffer->iface.init_tensor) {
+        src->buffer->iface.init_tensor(src->buffer, const_cast<ggml_tensor *>(src));
+    }
+    if (dst->extra == nullptr && dst->buffer->iface.init_tensor) {
+        dst->buffer->iface.init_tensor(dst->buffer, dst);
+    }
+    if (src->extra == nullptr || dst->extra == nullptr || ggml_nbytes(src) == 0) {
+        return src->extra != nullptr && dst->extra != nullptr;
+    }
+
+    ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) src->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
+    const size_t off_s = (size_t) es->offset + src->view_offs;
+    const size_t off_d = (size_t) ed->offset + dst->view_offs;
+    if (es->data_device == ed->data_device && off_s == off_d) {
+        return true;
+    }
+
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dst->buffer->buft->device);
+    const size_t n = ggml_nbytes(src);
+    CL_CHECK(clEnqueueCopyBuffer(
+        backend_ctx->queue, es->data_device, ed->data_device,
+        off_s, off_d, n,
+        es->evt ? 1 : 0, es->evt ? &es->evt : NULL, &ed->evt));
+    return true;
+}
 
 static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
@@ -2151,7 +2205,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_opencl_buffer_memset,
     /* .set_tensor      = */ ggml_backend_opencl_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
-    /* .cpy_tensor      = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_opencl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
 };
@@ -2209,13 +2263,20 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
         printf("ALLOC %-9.9s %-32.32s %8zx %8zx (%zu,%zu,%zu)\n", ggml_op_name(tensor->op), tensor->name, offset, ggml_nbytes(tensor),
         tensor->ne[0],tensor->ne[1],tensor->ne[2] );
 #endif
-        ggml_tensor_extra_cl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
-        GGML_ASSERT(extra->evt == nullptr);// все события освобождаются когда завершается цикл расчета графа
-        extra->evt = nullptr;
-        extra->offset = offset;
-        extra->data_device = ctx->buffer[0];// почему 0?
-        extra->actual_size = ggml_nbytes(tensor);
-
+        ggml_tensor_extra_cl * extra = ctx->lookup_plain_extra(offset);
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (extra == nullptr) {
+            extra = ctx->ggml_opencl_alloc_temp_tensor_extra();
+            extra->evt = nullptr;
+            extra->offset = offset;
+            extra->data_device = ctx->buffer[0];
+            extra->actual_size = nbytes;
+            ctx->register_plain_extra(offset, extra);
+        } else if (nbytes > extra->actual_size) {
+            // На этом смещении уже сидел меньший тензор. Подбуфер по его размеру
+            // обрезает строку: первая голова пишется, вторая остаётся прежней.
+            extra->actual_size = nbytes;
+        }
         tensor->extra = extra;
     }
     return GGML_STATUS_SUCCESS;
@@ -2507,9 +2568,16 @@ printf("SET %-4s %5zd%s\t; %s\t\t\n", ggml_type_name(tensor->type), size/scale,u
             queue, extra->data_device, CL_BLOCKING, extra->offset + offset,
             size, data, 0, NULL, NULL));
     } else */
+        // Байты хоста живы только до возврата. Копировщик читает их сам,
+        // поэтому ждём событие здесь. Само событие остаётся: ядро может на него встать.
+        cl_event prev = extra->evt;
         CL_CHECK(clEnqueueWriteBuffer(
         queue, extra->data_device, CL_NON_BLOCKING, extra->offset + offset,
-        size, data, 0, NULL, &extra->evt));
+        size, data, prev ? 1 : 0, prev ? &prev : NULL, &extra->evt));
+        if (prev) {
+            CL_CHECK(clReleaseEvent(prev));
+        }
+        CL_CHECK(clWaitForEvents(1, &extra->evt));
 
     GGML_UNUSED(buffer);
 }
@@ -3332,6 +3400,10 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
+    if (ggml_nelements(src0) == 0 || ggml_nelements(src1) == 0 || ggml_nelements(dst) == 0) {
+        return;
+    }
+
     const int  ne00 = src0 ? src0->ne[0] : 0;
     const int  ne01 = src0 ? src0->ne[1] : 0;
     const int  ne02 = src0 ? src0->ne[2] : 0;
@@ -3526,6 +3598,10 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
     GGML_ASSERT(src1->extra);
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
+
+    if (ggml_nelements(src0) == 0 || ggml_nelements(src1) == 0 || ggml_nelements(dst) == 0) {
+        return;
+    }
 
     const int ne00 = src0 ? src0->ne[0] : 0;
     const int ne01 = src0 ? src0->ne[1] : 0;
@@ -4053,8 +4129,17 @@ static cl_mem _get_cl_buffer(const ggml_tensor * tensor, cl_mem_flags mem_flags)
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *)tensor->extra;
 GGML_ASSERT(tensor->view_offs==0);
-    region.origin = extra->offset;// + tensor->view_offs; 
-    region.size = extra->actual_size;
+    region.origin = extra->offset;// + tensor->view_offs;
+    // Размер — у этого тензора. actual_size мог остаться от меньшего жильца того же смещения.
+    region.size = ggml_nbytes(tensor);
+    if (extra->actual_size < region.size) {
+        extra->actual_size = region.size;
+    }
+    // Ноль байт OpenCL отвергает как -61. Пустой тензор не читается, подбуфер не заводим.
+    if (region.size == 0) {
+        CL_CHECK(clRetainMemObject(extra->data_device));
+        return extra->data_device;
+    }
     cl_mem buffer = clCreateSubBuffer(extra->data_device, mem_flags, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
     if (status){
         char buf[128];
@@ -4818,7 +4903,7 @@ GGML_ASSERT(ne13==1);
 GGML_ASSERT(!ggml_is_transposed(src0) && "src0 transposed"); // не встречается совсем
 GGML_ASSERT(!ggml_is_transposed(src1) && "src1 transposed"); //
 GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1);// ggml_is_3d(src0) && ggml_is_3d(src1)); --  размерность не превышает 3х
-GGML_ASSERT(src0->ne[0] == src1->ne[0] && src0->ne[0]%32==0);// операции всегда выполняются по строкам, строки кратны 32
+GGML_ASSERT(src0->ne[0] == src1->ne[0]);// широкое ядро само требует K%32; короткий K бывает длиной в токены
 
 if (ggml_is_quantized(src0->type)){
     GGML_ASSERT(ggml_is_contiguous(src0));

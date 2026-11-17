@@ -291,16 +291,22 @@ inline float silu(float x){  return x *native_recip(1.f + exp(-x)); }
 REQD_SUBGROUP_SIZE_DEFAULT
 kernel void mv_q8_0_f32(global char* src, global float *src1, global float *dst, uint ne00, uint nb01)
 {
+    // Строка — номер группы. Подгруппы вместе суммируют один ряд, не пишут соседние головы.
     uint row = get_group_id(0);
-    global struct block_q8_0 *blk = (global struct block_q8_0 *)(src + mul24(row,nb01));
-    float sumf=0;
-    for(uint i=get_sub_group_local_id(); i < ne00; i+=get_max_sub_group_size()){
-        float y = (src1[i]);// деквантизовать вектор
-        sumf+=dequantize_block_q8_0(blk[i/QK8_0].qs, blk[i/QK8_0].d)*y;
+    global char * base = src + (ulong) row * nb01;
+    float sumf = 0.f;
+    for (uint i = get_local_id(0); i < ne00; i += get_local_size(0)) {
+        uint block = i >> 5;
+        uint lane  = i & 31;
+        global char * b = base + (ulong) block * 34u;
+        float d = (float) (*((global half *) b));
+        float q = (float) b[2u + lane];
+        sumf = fma(q * d, src1[i], sumf);
     }
-    sumf = sub_group_reduce_add(sumf);
-    if (get_sub_group_local_id()==0)
+    sumf = work_group_reduce_add(sumf);
+    if (get_local_id(0) == 0) {
         dst[row] = sumf;
+    }
 }
 REQD_SUBGROUP_SIZE_DEFAULT
 kernel void mva_q8_0_f32(global char* src, global float *src1, global float *src2, global float *dst, 
@@ -312,20 +318,24 @@ kernel void mva_q8_0_f32(global char* src, global float *src1, global float *src
     float alpha
 )
 {
-    uint r0 = get_group_id(0);
-    uint r1 = get_group_id(1);// batch
-
-    uint row = get_num_sub_groups()*r0 + get_sub_group_id();
-    global struct block_q8_0 *blk = (global struct block_q8_0 *)src + mul24(row,ne00/QK8_0);
-    src1 = (global float     *) src1 + mul24(r1,ne10);
-    float sumf=0;
-    for(uint i=get_sub_group_local_id(); i < ne00; i+=get_max_sub_group_size()){
-        float y = (src1[i]);
-        sumf+=dequantize_block_q8_0(blk[i/QK8_0].qs, blk[i/QK8_0].d)*y;
+    uint row = get_group_id(0);
+    uint r1  = get_group_id(1);
+    global char * base = src + (ulong) row * (ulong)(ne00 >> 5) * 34u;
+    global float * y = src1 + (ulong) r1 * ne10;
+    float sumf = 0.f;
+    for (uint i = get_local_id(0); i < ne00; i += get_local_size(0)) {
+        uint block = i >> 5;
+        uint lane  = i & 31;
+        global char * b = base + (ulong) block * 34u;
+        float d = (float) (*((global half *) b));
+        float q = (float) b[2u + lane];
+        sumf = fma(q * d, y[i], sumf);
     }
-    sumf = sub_group_reduce_add(sumf);
-    if (get_sub_group_local_id()==0)
-        dst[mad24(r1,ne0,row)] = alpha*sumf + src2[mad24((r1%ne1),ne0, row)];
+    sumf = work_group_reduce_add(sumf);
+    if (get_local_id(0) == 0) {
+        uint bias = ne1 == 0u ? 0u : (r1 % ne1);
+        dst[(ulong) r1 * ne0 + row] = alpha * sumf + src2[(ulong) bias * ne0 + row];
+    }
 }
 
 REQD_SUBGROUP_SIZE_DEFAULT
