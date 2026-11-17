@@ -8,3 +8,10 @@
 | — | RPC → docID/ZC | `/home/george/qnn-backend-rpc` |
 
 Знания — QuantumNN. Сводка: `QuantumNN/PLAN-quant-rpc.md`. Инвариант: не `And(arc, adreno)`.
+
+
+## Модели прогона
+
+Сейчас только Qwen и Gemma. У обеих метка чата — один токен `<|im_start|>` (у Qwen это 151644).
+
+TODO, не этот этап: ряд моделей другой архитектуры. TinyLlama сюда не входит: шаблон пишет `<|system|>`, в словаре такого токена нет.

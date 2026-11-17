@@ -66,6 +66,13 @@ path: /home/george/qnn-backend-ocl/README.md
 | `docs/` | MCP_IR, план вех |
 | `log/` | журнал; конфиг Qwen/arc3 |
 
+
+## Публичность
+
+До **2026-11-18** — **private** (три дня разработки).
+Потом: вычистить операционку (`log/qwen/` и снимки с LAN/путями) → **public**.
+Не путать с дедлайном канала Курсора (17-е): открытие репо — отдельный шаг после чистки.
+
 **подпись:** Курсор
 
 ## Конфиг Qwen (эталон контура)
@@ -73,3 +80,5 @@ path: /home/george/qnn-backend-ocl/README.md
 Снимок: `log/2026-11-15 qwen конфиг arc3.md` · файлы `log/qwen/`.
 Живое на arc3: `~/models/gguf/qwen-*.env`, порт `18081`, KV `f8_e4m3`, temp 0.
 Сборка llama.cpp: CUDA 13.2 · arch `120a` · `GGML_CUDA=ON` — `log/qwen/llama-cpp-build.env`.
+
+Связка команды OCL+RPC+Qwen: `QuantumNN/PLAN-team-ocl-rpc-qwen.md` (RPC = шаг флота).
