@@ -872,7 +872,9 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     //    (err != CL_INVALID_QUEUE_PROPERTIES && err != CL_INVALID_VALUE ? err :
     //    (queue = clCreateCommandQueue(context, device, 0, &err), err)
     //)));
-    cl_command_queue_properties command_queue_props = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+    // Вне порядка поздний слой читает KV раньше, чем SET_ROWS его записал:
+    // с покадровой синхронизацией TinyLlama сходится, без неё кэш чужой и текст рассыпается.
+    cl_command_queue_properties command_queue_props = 0;
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
