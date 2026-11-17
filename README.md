@@ -55,6 +55,12 @@ path: /home/george/qnn-backend-ocl/README.md
 - Пресеты `opencl-arc` / `opencl-adreno` не смешивать (см. QuantumNN/SAT.md · урок 2).
 - Совместимость: общий Tensor IR + те же ops; LL-HW / ICD-профиль — отдельная половина двери `ADRENO`, не развилка продукта.
 
+## Сервер флота
+
+Этот репозиторий не крутится как RPC-сервер. OpenCL флота — llama.cpp `fc504f91d` и патч `qnn-backend-rpc/notes/patches/0002-llama-cpp-10.0.1.patch`, протокол `10.0.1`. Бинарь на phantom: `~/src/llama-cpp-next`, порт `18769`.
+
+Здесь остаётся тензорный ассемблер, IR и ядра старого `ggml-opencl`. Ими текущий сервер не заменяют. Речь Qwen на сборке 10.0.1 уже совпала с CUDA. Следующая правка устройства пишется патчем в то дерево llama.cpp.
+
 ## Дерево
 
 | путь | что |
