@@ -92,4 +92,11 @@ int mcp_ir_host_binop(uint8_t op, struct mcp_ir_slot *dst,
 int mcp_ir_host_unary(uint8_t op, struct mcp_ir_slot *dst,
 		      const struct mcp_ir_slot *a);
 
+/** Фраза на кольце. head — сколько слотов уже живы.
+ *  Строка пишет следующий слот и сдвигает head.
+ *  ADD, MUL, SILU, RMS_NORM. Пустая строка и BARRIER проходят. Иной op — −3.
+ */
+int mcp_ir_host_phrase(struct mcp_ir_slot *ring, uint16_t cap, uint16_t *head,
+		       const char *const *lines, int nlines);
+
 #endif

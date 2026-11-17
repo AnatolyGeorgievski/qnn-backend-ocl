@@ -212,3 +212,53 @@ int mcp_ir_host_unary(uint8_t op, struct mcp_ir_slot *dst,
 	}
 	return -3;
 }
+
+int mcp_ir_host_phrase(struct mcp_ir_slot *ring, uint16_t cap, uint16_t *head,
+		       const char *const *lines, int nlines)
+{
+	int i;
+
+	if (!ring || !head || (!lines && nlines > 0) || nlines < 0)
+		return -1;
+	for (i = 0; i < nlines; i++) {
+		struct mcp_ir_node n;
+		int rc, sa, sb;
+
+		rc = mcp_ir_node_from_line(lines[i], &n);
+		if (rc == -1)
+			continue;
+		if (rc != 0)
+			return rc;
+		if (n.op == MCP_IR_NOP || n.op == MCP_IR_BARRIER)
+			continue;
+		if (*head >= cap)
+			return -4;
+		if (n.op == MCP_IR_ADD || n.op == MCP_IR_MUL) {
+			if (n.n_src < 2)
+				return -5;
+			sa = mcp_ir_resolve_src(n.src[0], *head);
+			sb = mcp_ir_resolve_src(n.src[1], *head);
+			if (sa < 0 || sb < 0 || sa >= (int)*head || sb >= (int)*head)
+				return -6;
+			rc = mcp_ir_host_binop(n.op, &ring[*head], &ring[sa], &ring[sb]);
+			if (rc)
+				return rc;
+			(*head)++;
+			continue;
+		}
+		if (n.op == MCP_IR_SILU || n.op == MCP_IR_RMS_NORM) {
+			if (n.n_src < 1)
+				return -5;
+			sa = mcp_ir_resolve_src(n.src[0], *head);
+			if (sa < 0 || sa >= (int)*head)
+				return -6;
+			rc = mcp_ir_host_unary(n.op, &ring[*head], &ring[sa]);
+			if (rc)
+				return rc;
+			(*head)++;
+			continue;
+		}
+		return -3;
+	}
+	return 0;
+}
