@@ -3788,7 +3788,7 @@ kernel void kernel_mul_mat_f16_f32_1row(
     global float * y = (global float *) (src1 + offset_src1);
 
     float sumf = 0;
-    for (int i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
+    for (int i = get_sub_group_local_id(); i < ne00; i += get_sub_group_size()) {
         sumf += x[i] * y[i];
     }
     float all_sum = sub_group_reduce_add(sumf);
@@ -3850,33 +3850,55 @@ kernel void kernel_mul_mat_f16_f32(
     global half * x = (global half *) (src0 + offset_src0);
     global float* y = (global float*) (src1 + offset_src1);
 #endif
-    global ushort * x = (global ushort*) (src0 + r0*nb01 + (im/r2)*nb02);
-    global float  * y = (global float *) (src1 + rb*nb11 + (im   )*nb12);
+    global half * xh = (global half *) (src0 + r0*nb01 + (im/r2)*nb02);
 
-
-    float16 sumf = (0);
-
-    //if (ne00 % 8==0){// можно сделать отдельную функцию
-    for (uint i = 0; i < ne00/8; i += get_max_sub_group_size()){
-        float8 v = convert_float8(as_half8(intel_sub_group_block_read_us8((global ushort*)x+i*8)));
+    // Блок us8 берёт 8 полуслов на дорожку. Короче этого шага он залезает в соседнюю строку.
+    // laurel_r как раз K=64.
+    if ((ne00 % (8 * (int) get_sub_group_size())) != 0) {
         for (uint row = 0; row < N_F16_F32; ++row) {
-            float8 u = as_float8(intel_sub_group_block_read8((global uint*)y+i*8+row*nb11/4));// x16 8x4=256
-            sumf[row] += dot(v.lo, u.lo);
-            sumf[row] += dot(v.hi, u.hi);
+            uint r1 = rb + row;
+            if (r1 >= (uint) ne11) {
+                break;
+            }
+            global float * y = (global float *) (src1 + r1*nb11 + im*nb12);
+            float sumf = 0.f;
+            for (uint i = get_sub_group_local_id(); i < (uint) ne00; i += get_sub_group_size()) {
+                sumf += convert_float(xh[i]) * y[i];
+            }
+            sumf = sub_group_reduce_add(sumf);
+            if (get_sub_group_local_id() == 0) {
+                dst[im*ne1*ne0 + r1*ne0 + r0] = sumf;
+            }
         }
-    }
-    for (uint i = ne00&~7; i < ne00; i += get_max_sub_group_size()){
-        float v = convert_float(as_half(intel_sub_group_block_read_us((global ushort*)x+i)));
+    } else {
+        global ushort * x = (global ushort *) xh;
+        global float  * y = (global float *) (src1 + rb*nb11 + im*nb12);
+        float16 sumf = (0);
+        const uint step = get_sub_group_size();
+        for (uint i = 0; i < (uint) ne00/8; i += step) {
+            float8 v = convert_float8(as_half8(intel_sub_group_block_read_us8((global ushort *) x + i*8)));
+            for (uint row = 0; row < N_F16_F32; ++row) {
+                float8 u = as_float8(intel_sub_group_block_read8((global uint *) y + i*8 + row*nb11/4));
+                sumf[row] += dot(v.lo, u.lo);
+                sumf[row] += dot(v.hi, u.hi);
+            }
+        }
+        for (uint i = (uint) ne00 & ~7u; i < (uint) ne00; i += step) {
+            float v = convert_float(as_half(intel_sub_group_block_read_us((global ushort *) x + i)));
+            for (uint row = 0; row < N_F16_F32; ++row) {
+                float u = as_float(intel_sub_group_block_read((global uint *) y + i + row*nb11/4));
+                sumf[row] += v * u;
+            }
+        }
         for (uint row = 0; row < N_F16_F32; ++row) {
-            float u = as_float(intel_sub_group_block_read((global uint*)y+i+row*nb11/4));// x16 8x4=256
-            sumf[row] += v * u;
+            if (rb + row >= ne11) {
+                break;
+            }
+            sumf[row] = sub_group_reduce_add(sumf[row]);
+            if (get_sub_group_local_id() == 0) {
+                dst[im*ne1*ne0 + rb*ne0 + row*ne0 + r0] = sumf[row];
+            }
         }
-    }
-    for (uint row = 0; row < N_F16_F32; ++row){
-        if (rb + row >= ne11) break;
-        sumf[row] = sub_group_reduce_add(sumf[row]);
-        if (get_sub_group_local_id() == 0)
-            dst[im*ne1*ne0 + rb*ne0 + row*ne0 + r0] = sumf[row];
     }
 }
 //------------------------------------------------------------------------------

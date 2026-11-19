@@ -108,13 +108,22 @@ static cl_int qnn_clReleaseMemObject(cl_mem mem) {
 #define clReleaseMemObject qnn_clReleaseMemObject
 
 
+static int qnn_in_graph;
+static int qnn_op_bad;
+static cl_int qnn_cl_err;
+
 #define CL_CHECK(err)                                               \
     do {                                                            \
         cl_int err_ = (err);                                        \
         if (err_ != CL_SUCCESS) {                                   \
             printf("ggml_opencl: %s error %d at %s:%d\n",  \
                 #err, err_, __FILE__, __LINE__);                    \
-            GGML_ASSERT(0);                                         \
+            if (qnn_in_graph) {                                     \
+                qnn_cl_err = err_;                                  \
+            } else {                                                \
+                GGML_ASSERT(0);                                     \
+            }                                                       \
+        } else {                                                    \
         }                                                           \
     } while (0)
 
@@ -1805,6 +1814,39 @@ static void qnn_ensure_extra(ggml_tensor * t) {
     t->buffer->iface.init_tensor(t->buffer, t);
 }
 
+
+static void qnn_drop_graph_events(ggml_cgraph * cgraph) {
+    for (int j = 0; j < cgraph->n_nodes; j++) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n == nullptr || n->extra == nullptr) {
+            continue;
+        } else {
+            ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) n->extra;
+            if (ex->evt != nullptr) {
+                clReleaseEvent(ex->evt);
+                ex->evt = nullptr;
+            } else {
+            }
+        }
+    }
+}
+
+static void qnn_reset_queue(ggml_backend_opencl_context * ctx) {
+    if (ctx->queue != nullptr) {
+        clReleaseCommandQueue(ctx->queue);
+        ctx->queue = nullptr;
+    } else {
+    }
+    cl_int err = CL_SUCCESS;
+    cl_command_queue_properties props = CL_QUEUE_PROFILING_ENABLE;
+    ctx->queue = clCreateCommandQueue(ctx->context, ctx->device, props, &err);
+    if (err != CL_SUCCESS || ctx->queue == nullptr) {
+        GGML_LOG_ERROR("qnn_ocl: queue reset failed %d\n", err);
+        ctx->queue = nullptr;
+    } else {
+    }
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
 
 static int once = 0;
@@ -1821,7 +1863,18 @@ if (!once){
 
     // Очередь вне порядка. Загрузки лежат на описателях буфера, у узлов графа свои.
     // Дождаться их, иначе первое ядро читает буфер раньше записи.
+    qnn_in_graph = 1;
+    qnn_op_bad = 0;
+    qnn_cl_err = 0;
     CL_CHECK(clFinish(backend_ctx->queue));
+    if (qnn_cl_err == 0) {
+    } else {
+        GGML_LOG_ERROR("%s: queue finish failed %d\n", __func__, qnn_cl_err);
+        qnn_reset_queue(backend_ctx);
+        qnn_cl_err = 0;
+        qnn_in_graph = 0;
+        return GGML_STATUS_FAILED;
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1963,11 +2016,17 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
 /*  Команда VIEW должна ставить буфер из кеша в очередь 
     Команда CPY  должна 
  */
-        bool ok = ggml_cl_compute_forward(backend, node);// &events[idx++]
-        if (!ok) {
-            GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        bool ok = ggml_cl_compute_forward(backend, node);
+        if (ok && qnn_op_bad == 0 && qnn_cl_err == 0) {
+        } else {
+            GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            qnn_drop_graph_events(cgraph);
+            qnn_reset_queue(backend_ctx);
+            qnn_op_bad = 0;
+            qnn_cl_err = 0;
+            qnn_in_graph = 0;
+            return GGML_STATUS_FAILED;
         }
-        GGML_ASSERT(ok);
     }
 
 // освободить все события и завершить все 
@@ -2058,7 +2117,17 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
     printf("\e[0m kernel_time=%4.1f ms, total = %4.1f ms\n", kernel_time/(1.e6f), (total_max-total_min)*1.e-6f);
 #endif
 
-    return GGML_STATUS_SUCCESS;
+    qnn_in_graph = 0;
+    if (qnn_op_bad == 0 && qnn_cl_err == 0) {
+        return GGML_STATUS_SUCCESS;
+    } else {
+        GGML_LOG_ERROR("%s: queue error after graph\n", __func__);
+        qnn_drop_graph_events(cgraph);
+        qnn_reset_queue(backend_ctx);
+        qnn_op_bad = 0;
+        qnn_cl_err = 0;
+        return GGML_STATUS_FAILED;
+    }
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -2288,9 +2357,19 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
-        case GGML_OP_IM2COL:
         case GGML_OP_POOL_2D:
             return false;
+        case GGML_OP_IM2COL: {
+            const ggml_tensor * img = op->src[1];
+            if (img == nullptr || img->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+                return false;
+            }
+            const int32_t is_2d = ((const int32_t *) op->op_params)[6];
+            return is_2d == 0 || is_2d == 1;
+        }
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_GET_ROWS_BACK:
         case GGML_OP_IM2COL_BACK:
@@ -2341,10 +2420,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_SILU_BACK:
         case GGML_OP_SOFT_MAX_BACK:
             return false;
-        default:
-			if (1) printf(" UNSUPPORTED OP %s %s %s\n", ggml_op_name(op->op), op->src[0]?ggml_type_name(op->src[0]->type):"", op->src[1]?ggml_type_name(op->src[1]->type):"");
-_Exit(1);
+        default: {
             return false;
+        }
     }
 }
 
@@ -3710,8 +3788,18 @@ static void ggml_cl_nop(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 /*! \brief Кеширование результата */
 static void ggml_cl_get_rows_i32(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    if (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows_i32");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->type == GGML_TYPE_I32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows_i32");
+        qnn_op_bad = 1;
+        return;
+    }
     const cl_uint ne00 = src0->ne[0];
     const cl_uint n_rows = src1->ne[0];
     if (ne00 == 0 || n_rows == 0) {
@@ -3722,7 +3810,12 @@ static void ggml_cl_get_rows_i32(ggml_backend_t backend, const ggml_tensor * src
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     cl_kernel kernel = backend_ctx->kernel_get_rows[GGML_TYPE_I32];
-    GGML_ASSERT(kernel != nullptr);
+    if (kernel != nullptr) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows_i32");
+        qnn_op_bad = 1;
+        return;
+    }
     int arg = 0;
     cl_mem A_d = _get_cl_buffer(src0, CL_MEM_READ_ONLY);
     cl_mem B_d = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
@@ -3746,12 +3839,42 @@ static void ggml_cl_get_rows_i32(ggml_backend_t backend, const ggml_tensor * src
 }
 
 static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
     if (src0->type == GGML_TYPE_I32) {
         ggml_cl_get_rows_i32(backend, src0, src1, dst);
         return;
@@ -3773,11 +3896,26 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
     cl_kernel kernel = backend_ctx->kernel_get_rows[src0->type];
-    GGML_ASSERT( dst->type==GGML_TYPE_F32);
-    GGML_ASSERT(src1->type==GGML_TYPE_I32 && ggml_is_vector(src1) && ne11==1);
+    if ( dst->type==GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->type==GGML_TYPE_I32 && ggml_is_vector(src1) && ne11==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
     if (src0->type == GGML_TYPE_F32 && !(ggml_is_contiguous(src0) && (ne00 % 32) == 0)) {
         cl_kernel sk = backend_ctx->kernel_get_rows_f32_strided;
-        GGML_ASSERT(sk != nullptr);
+        if (sk != nullptr) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+            qnn_op_bad = 1;
+            return;
+        }
         ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
         ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
         const cl_uint nb00 = src0->nb[0];
@@ -3806,7 +3944,12 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     }
     if (src0->type == GGML_TYPE_F16) {
         cl_kernel sk = backend_ctx->kernel_get_rows[GGML_TYPE_F16];
-        GGML_ASSERT(sk != nullptr);
+        if (sk != nullptr) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+            qnn_op_bad = 1;
+            return;
+        }
         ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
         ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
         cl_mem A_d = _get_cl_buffer(src0, CL_MEM_READ_ONLY);
@@ -3833,8 +3976,18 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         CL_CHECK(clReleaseMemObject(C_d));
         return;
     }
-    GGML_ASSERT(ggml_is_matrix(src0) && ggml_is_contiguous(src0));
-    GGML_ASSERT(kernel!=nullptr && "not implemented");
+    if (ggml_is_matrix(src0) && ggml_is_contiguous(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (kernel!=nullptr && "not implemented") {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_get_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     
     cl_mem A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
@@ -3899,14 +4052,54 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
 
 static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int ne01 = src0->ne[1];
     const int ne02 = src0->ne[2];
@@ -3921,7 +4114,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
     const int ne11 = src1->ne[1];
     const int ne12 = src1->ne[2];
-    GGML_ASSERT(ne11 > 0 && ne12 > 0);
+    if (ne11 > 0 && ne12 > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const cl_ulong nb10 = src1->nb[0];
     const cl_ulong nb11 = src1->nb[1];
@@ -3933,7 +4131,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     const cl_ulong nb3 = dst->nb[3];
 
     const int nblk0 = ne0 / ggml_blck_size(dst->type);
-    GGML_ASSERT(nblk0 > 0);
+    if (nblk0 > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     cl_command_queue queue = backend_ctx->queue;
@@ -3952,7 +4155,12 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     } else if (dst->type == GGML_TYPE_F16) {
         kernel = src1->type == GGML_TYPE_I64 ? backend_ctx->kernel_set_rows_f16_i64 : backend_ctx->kernel_set_rows_f16_i32;
     }
-    GGML_ASSERT(kernel != nullptr);
+    if (kernel != nullptr) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_set_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -3998,12 +4206,42 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 }
 
 static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_add");
+        qnn_op_bad = 1;
+        return;
+    }
 
     if (ggml_nelements(src0) == 0 || ggml_nelements(src1) == 0 || ggml_nelements(dst) == 0) {
         return;
@@ -4142,12 +4380,42 @@ static inline int32_t _tensor_get_param_i32(const ggml_tensor* tensor, int idx )
     return tensor->op_params[idx];
 }
 static void ggml_cl_gga(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
 
 //    const int  ne10 = src1->ne[0];
 //    const int  ne11 = src1->ne[1];
@@ -4157,10 +4425,30 @@ static void ggml_cl_gga(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    GGML_ASSERT(src0->op==GGML_OP_GET_ROWS);
-    GGML_ASSERT(src1->op==GGML_OP_GET_ROWS);
-    GGML_ASSERT(src0->src[1]->type==GGML_TYPE_I32);
-    GGML_ASSERT(src1->src[1]->type==GGML_TYPE_I32);
+    if (src0->op==GGML_OP_GET_ROWS) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->op==GGML_OP_GET_ROWS) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->src[1]->type==GGML_TYPE_I32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->src[1]->type==GGML_TYPE_I32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gga");
+        qnn_op_bad = 1;
+        return;
+    }
     int32_t row0 = _tensor_get_param_i32(src0->src[1], 0);
     int32_t row1 = _tensor_get_param_i32(src1->src[1], 0);
     //printf("row0=%d row1=%d\n", row0, row1);
@@ -4196,12 +4484,42 @@ static void ggml_cl_gga(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 
 static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul");
+        qnn_op_bad = 1;
+        return;
+    }
 
     if (ggml_nelements(src0) == 0 || ggml_nelements(src1) == 0 || ggml_nelements(dst) == 0) {
         return;
@@ -4347,11 +4665,36 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
     }
 }
 static void _cl_unary_op(ggml_backend_opencl_context* backend_ctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
-    GGML_ASSERT(dst->op==GGML_OP_UNARY);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->op==GGML_OP_UNARY) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+        qnn_op_bad = 1;
+        return;
+    }
     cl_kernel kernel = backend_ctx->kernel_unary[ggml_get_unary_op(dst)];
     if (dst->type==GGML_TYPE_F32) 
         kernel = backend_ctx->kernel_unary[ggml_get_unary_op(dst)];
@@ -4360,7 +4703,12 @@ static void _cl_unary_op(ggml_backend_opencl_context* backend_ctx, const ggml_te
     else if(dst->type==GGML_TYPE_BF16)
         kernel = backend_ctx->kernel_unary_bf16[ggml_get_unary_op(dst)];
     else
-        GGML_ASSERT(0 && "UNARY type");
+        if (0 && "UNARY type") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+            qnn_op_bad = 1;
+            return;
+        }
 
 
     cl_command_queue queue = backend_ctx->queue;
@@ -4373,7 +4721,12 @@ static void _cl_unary_op(ggml_backend_opencl_context* backend_ctx, const ggml_te
     size_t local_work_size[] = {1, 1, 1};
     if (!dense && dst->type == GGML_TYPE_F32) {
         kernel = backend_ctx->kernel_unary_strided[ggml_get_unary_op(dst)];
-        GGML_ASSERT(kernel != nullptr);
+        if (kernel != nullptr) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void _cl_unary_op");
+            qnn_op_bad = 1;
+            return;
+        }
         const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
         const cl_ulong nb0 = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &A_d));
@@ -4470,10 +4823,30 @@ static void ggml_cl_gelu(ggml_backend_t backend, const ggml_tensor * src0, const
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     _cl_unary_op(backend_ctx, src0, dst);
 #if 0
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gelu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gelu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gelu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_gelu");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4513,10 +4886,30 @@ static void ggml_cl_silu(ggml_backend_t backend, const ggml_tensor * src0, const
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     _cl_unary_op(backend_ctx, src0, dst);
 #if 0
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_silu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_silu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_silu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_silu");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4561,10 +4954,30 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     _cl_unary_op(backend_ctx, src0, dst);
 #if 0
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_relu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_relu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_relu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_relu");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4603,10 +5016,30 @@ static void ggml_cl_relu(ggml_backend_t backend, const ggml_tensor * src0, const
 }
 
 static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_clamp");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_clamp");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_clamp");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_clamp");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4644,10 +5077,30 @@ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, cons
 }
 
 static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_norm");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4660,7 +5113,12 @@ static void ggml_cl_norm(ggml_backend_t backend, const ggml_tensor * src0, const
     const cl_uint  ne00 = src0->ne[0];
     const cl_ulong nb01 = src0->nb[1];
 
-    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    if (ggml_is_contiguous_1(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_norm");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int nth = MIN(64, ne00);
 
@@ -4767,12 +5225,16 @@ static cl_mem _get_cl_buffer(const ggml_tensor * tensor, cl_mem_flags mem_flags)
         return extra->data_device;
     }
     cl_mem buffer = clCreateSubBuffer(extra->data_device, mem_flags, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
-    if (status){
-        char buf[128];
-        sprintf(buf, "ERR:CreateSubBuffer %s(%zu,%zu,%zu) status=%d\n", tensor->name, tensor->ne[0],tensor->ne[1],tensor->ne[2], status);
-        puts(buf);
+    if (status != CL_SUCCESS) {
+        printf("ERR:CreateSubBuffer %s(%zu,%zu,%zu) status=%d\n", tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], status);
+        if (qnn_in_graph) {
+            qnn_cl_err = status;
+            return nullptr;
+        } else {
+            GGML_ASSERT(0);
+        }
+    } else {
     }
-    CL_CHECK(status);
     return buffer;
 }
 /*! \brief выделить одну строку из матрицы и создать буфер для загрузки 
@@ -4788,28 +5250,58 @@ static cl_mem _get_cl_buffer_row(const ggml_tensor * tensor, int row, cl_mem_fla
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *)tensor->extra;
     const size_t blck_size = ggml_blck_size(tensor->type);
-    GGML_ASSERT(blck_size==1);// только для типов tf32 f16 bf16 и т.п.
+    if (blck_size == 1) {
+    } else {
+        qnn_op_bad = 1;
+        return nullptr;
+    }
     const size_t nbytes = ggml_type_size(tensor->type);
     size_t offset = extra->offset + tensor->view_offs + row*tensor->ne[0]*nbytes;
     region.origin = offset; 
     region.size   = tensor->ne[0]*nbytes;
     cl_mem buffer = clCreateSubBuffer(extra->data_device, mem_flags, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
-    if (status){
-        printf("ERR:CreateSubBuffer %s(%zu,%zu,%zu) status=%d\n", tensor->name, tensor->ne[0],tensor->ne[1],tensor->ne[2], status);
+    if (status != CL_SUCCESS) {
+        printf("ERR:CreateSubBuffer row %s(%zu,%zu,%zu) status=%d\n", tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], status);
+        if (qnn_in_graph) {
+            qnn_cl_err = status;
+            return nullptr;
+        } else {
+            GGML_ASSERT(0);
+        }
+    } else {
     }
-    CL_CHECK(status);
     return buffer;
 }
 
 static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(dst);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
     // Ноль строк или ноль длины: CPU не входит в циклы, деления на ne00 нет.
     if (src0->ne[0] == 0 || ggml_nrows(src0) == 0) {
         return;
     }
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst->extra);
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -4824,8 +5316,18 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     const cl_uint ne00 = src0->ne[0];
     const cl_uint nb01 = src0->nb[1];
 
-    GGML_ASSERT(ne00 % 8 == 0);
-    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    if (ne00 % 8 == 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous_1(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const size_t nth = MIN(64, ne00/4);
 
@@ -4871,12 +5373,42 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clReleaseMemObject(C_d));
 }
 static void ggml_cl_rms_norm_mul(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -4888,8 +5420,18 @@ static void ggml_cl_rms_norm_mul(ggml_backend_t backend, const ggml_tensor * src
     const cl_uint nb01 = src0->nb[1];
     const cl_uint ne11 = src1->ne[1];
 
-    GGML_ASSERT(ne00 % 4 == 0);
-    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    if (ne00 % 4 == 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous_1(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rms_norm_mul");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int nth = MIN(64, ne00/4);
 
@@ -4930,14 +5472,54 @@ static void ggml_cl_rms_norm_mul(ggml_backend_t backend, const ggml_tensor * src
     CL_CHECK(clReleaseMemObject(C_d));
 }
 static void ggml_cl_mva(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(src2);
-    GGML_ASSERT(src2->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src2) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src2->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const enum ggml_type src0t = src0->type;
 //    const enum ggml_type src1t = src1->type;
@@ -4952,7 +5534,12 @@ static void ggml_cl_mva(ggml_backend_t backend, const ggml_tensor * src0, const 
     const cl_uint  ne01 = src0->ne[1];
     const cl_uint  ne02 = src0->ne[2];
     const cl_uint  ne03 = src0->ne[3];
-GGML_ASSERT(ne03==1);
+if (ne03==1) {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+    qnn_op_bad = 1;
+    return;
+}
 
 //    const cl_ulong nb00 = src0->nb[0];
 //    const cl_ulong nb01 = src0->nb[1];
@@ -4977,11 +5564,36 @@ GGML_ASSERT(ne03==1);
 //    int r2 = ne12/ne02;
 //    int r3 = ne13/ne03;
 
-    GGML_ASSERT(ne12*ne13==1);// batch
-    GGML_ASSERT(ne02==1);   // 
-    GGML_ASSERT(ne00==ne10);// K
-    GGML_ASSERT(ne01==ne0); // M dst[MxN]
-    GGML_ASSERT(ne11==ne1); // N
+    if (ne12*ne13==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ne02==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ne00==ne10) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ne01==ne0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ne11==ne1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+        qnn_op_bad = 1;
+        return;
+    }
 
     int nth0 = 32;
     int nth1 = 1;
@@ -5019,11 +5631,21 @@ GGML_ASSERT(ne03==1);
             break;
         default:
             printf("MVA %s %s %s %s\n", ggml_type_name(src0t), ggml_op_name(dst->op), ggml_op_name(dst->src[0]->op),ggml_op_name(dst->src[1]->op));
-            GGML_ASSERT(0 && "TODO MVA");
+            if (0 && "TODO MVA") {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+                qnn_op_bad = 1;
+                return;
+            }
             break;
         }
     } else {
-        GGML_ASSERT(false && "TODO: Unknown GPU");
+        if (false && "TODO: Unknown GPU") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mva");
+            qnn_op_bad = 1;
+            return;
+        }
     }
 
     kernel = backend_ctx->kernel_mva[src0t];
@@ -5063,14 +5685,54 @@ GGML_ASSERT(ne03==1);
     CL_CHECK(clReleaseMemObject(D_d)); 
 }
 static void ggml_cl_ffn         (ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(src2);
-    GGML_ASSERT(src2->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src2) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src2->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -5103,7 +5765,12 @@ static void ggml_cl_ffn         (ggml_backend_t backend, const ggml_tensor * src
         break;
     default:
         printf("FFN %s %s %s %s\n", ggml_type_name(src0->type), ggml_op_name(dst->op), ggml_op_name(dst->src[0]->op),ggml_op_name(dst->src[1]->op));
-        GGML_ASSERT(0 && "TODO FFN");
+        if (0 && "TODO FFN") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_ffn         ");
+            qnn_op_bad = 1;
+            return;
+        }
         break;
     }
 
@@ -5148,12 +5815,42 @@ static void ggml_cl_ffn         (ggml_backend_t backend, const ggml_tensor * src
 
 
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const enum ggml_type src0t = src0->type;
     const enum ggml_type src1t = src1->type;
@@ -5176,7 +5873,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const cl_uint  ne01 = src0->ne[1];
     const cl_uint  ne02 = src0->ne[2];
     const cl_uint  ne03 = src0->ne[3];
-GGML_ASSERT(ne03==1);
+if (ne03==1) {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
 
     const cl_ulong nb00 = src0->nb[0];
     const cl_ulong nb01 = src0->nb[1];
@@ -5190,7 +5892,12 @@ GGML_ASSERT(ne03==1);
     const cl_uint  ne12 = src1->ne[2];
     const cl_uint  ne13 = src1->ne[3];
 
-GGML_ASSERT(ne13==1);
+if (ne13==1) {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
 
     const cl_ulong nb10 = src1->nb[0];
     const cl_ulong nb11 = src1->nb[1];
@@ -5203,8 +5910,18 @@ GGML_ASSERT(ne13==1);
     cl_uint r2 = ne12/ne02;
     cl_uint r3 = ne13/ne03;
 
-    GGML_ASSERT(r3 == 1);
-    GGML_ASSERT(ne00 == ne10);
+    if (r3 == 1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ne00 == ne10) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 
     int nth0 = 32;
     int nth1 = 1;
@@ -5528,31 +6245,106 @@ GGML_ASSERT(ne13==1);
     } // if (ne01 && ne1)
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 // классификация матриц
-GGML_ASSERT(!ggml_is_transposed(src0) && "src0 transposed"); // не встречается совсем
-GGML_ASSERT(!ggml_is_transposed(src1) && "src1 transposed"); //
-GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1);// ggml_is_3d(src0) && ggml_is_3d(src1)); --  размерность не превышает 3х
-GGML_ASSERT(src0->ne[0] == src1->ne[0]);// широкое ядро само требует K%32; короткий K бывает длиной в токены
+if (!ggml_is_transposed(src0) && "src0 transposed") {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
+if (!ggml_is_transposed(src1) && "src1 transposed") {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
+if (src0->ne[3] == 1 && src1->ne[3] == 1) {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
+if (src0->ne[0] == src1->ne[0]) {
+} else {
+    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+    qnn_op_bad = 1;
+    return;
+}
 
 if (ggml_is_quantized(src0->type)){
-    GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(ggml_is_matrix(src0) && "src0 quantized tensor"); //
+    if (ggml_is_contiguous(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_matrix(src0) && "src0 quantized tensor") {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 } else 
 if (ggml_is_contiguous(src0)) {
 } else 
 if (src0->ne[0]*src0->nb[0]<src0->nb[1] && src0->nb[2]==src0->ne[1]*src0->nb[1]) {// submatrx
     // `nb[0]==_type_size()` AND `ne[0]*nb[0]< nb[1]` AND `ne[1]*nb[1]==nb[2]`
-    GGML_ASSERT(src0->nb[0]==ggml_type_size(src0->type));
-    GGML_ASSERT(src0->nb[1]> src0->ne[0]*src0->nb[0]);// шаг длинее строки
-    GGML_ASSERT(src0->nb[2]==src0->ne[1]*src0->nb[1]);// ggml_is_contiguous_1
-    GGML_ASSERT(src0->nb[3]==src0->ne[2]*src0->nb[2]);
-    GGML_ASSERT(src0->ne[3]==1);// is 3d
+    if (src0->nb[0]==ggml_type_size(src0->type)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[1]> src0->ne[0]*src0->nb[0]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[2]==src0->ne[1]*src0->nb[1]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[3]==src0->ne[2]*src0->nb[2]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->ne[3]==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 // range = src0->nb[3];
 } else if (ggml_is_permuted(src0)) {// `nb[0]==_type_size()` AND `nb[1]==ne[2]*nb[2]`
-    GGML_ASSERT(src0->nb[0]==ggml_type_size(src0->type));
-    GGML_ASSERT(src0->nb[2]==src0->ne[0]*src0->nb[0]);// contiguouse && permuted
-    GGML_ASSERT(src0->nb[1]==src0->ne[2]*src0->nb[2]);
+    if (src0->nb[0]==ggml_type_size(src0->type)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[2]==src0->ne[0]*src0->nb[0]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[1]==src0->ne[2]*src0->nb[2]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 //    GGML_ASSERT(src0->nb[3]==src0->ne[1]*src0->nb[1]);
-    GGML_ASSERT(ggml_is_3d(src1));
+    if (ggml_is_3d(src1)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 //    GGML_ASSERT(0 && "permuted");
 } else {
     if (1) printf("MM %s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu,%zu)%c %s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu)%c->%s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu)%c\n", 
@@ -5560,30 +6352,100 @@ if (src0->ne[0]*src0->nb[0]<src0->nb[1] && src0->nb[2]==src0->ne[1]*src0->nb[1])
         src1->name, src1->ne[0], src1->ne[1], src1->ne[2],src1->ne[3], src1->nb[0], src1->nb[1], src1->nb[2], ggml_is_contiguous(src1)?'c': ggml_is_permuted(src1)?'p':'n',
         dst->name, dst->ne[0], dst->ne[1], dst->ne[2],dst->ne[3], dst->nb[0], dst->nb[1], dst->nb[2], ggml_is_contiguous(src1)?'c':'n'
         ); 
-    GGML_ASSERT(0 && "not defined class");
+    if (0 && "not defined class") {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 }
 if (ggml_is_quantized(src1->type)){// матрицы весовых коэффициентов
-    GGML_ASSERT(ggml_is_contiguous(src1));
-    GGML_ASSERT(ggml_is_matrix(src1) && "src1 quantized tensor"); //
+    if (ggml_is_contiguous(src1)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_matrix(src1) && "src1 quantized tensor") {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 } else 
 if (src1->ne[0]*src1->nb[0]==src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]){// ggml_is_contiguous(src1)
-    GGML_ASSERT(src1->nb[1]==src1->ne[0]*src1->nb[0]);// contiguouse && permuted
-    GGML_ASSERT(src1->nb[2]==src1->ne[1]*src1->nb[1]);
-    GGML_ASSERT(src1->nb[3]==src1->ne[2]*src1->nb[2]);
-    GGML_ASSERT(src1->ne[3]==1);// is 3d
+    if (src1->nb[1]==src1->ne[0]*src1->nb[0]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->nb[2]==src1->ne[1]*src1->nb[1]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->nb[3]==src1->ne[2]*src1->nb[2]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->ne[3]==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 } else 
 if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]) {// submatrx - содержит подстроки
-    GGML_ASSERT(src1->nb[0]==ggml_type_size(src1->type));
-    GGML_ASSERT(src1->nb[2]==src1->ne[1]*src1->nb[1]);
-    GGML_ASSERT(src1->ne[3]==1);// is 3d
+    if (src1->nb[0]==ggml_type_size(src1->type)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->nb[2]==src1->ne[1]*src1->nb[1]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->ne[3]==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 } else if (ggml_is_permuted(src1)) {
-    GGML_ASSERT(src1->nb[0]==ggml_type_size(src1->type));
-    GGML_ASSERT(src1->nb[1]==src1->ne[2]*src1->nb[2]);
-    GGML_ASSERT(src1->ne[3]==1);// is 3d
+    if (src1->nb[0]==ggml_type_size(src1->type)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->nb[1]==src1->ne[2]*src1->nb[2]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->ne[3]==1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
     // GGML_ASSERT(0 && "permuted");
     // размер матрицы? =nb03
 } else {
-    GGML_ASSERT(0 && "not defined class");
+    if (0 && "not defined class") {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+        qnn_op_bad = 1;
+        return;
+    }
 }
 //! классификация матриц
 
@@ -5597,8 +6459,18 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         switch(src0t) {
             case GGML_TYPE_Q4_0:
                 // This should have been satisfied.
-                GGML_ASSERT(ne11 == ne1);
-                GGML_ASSERT(ne01 == ne0);
+                if (ne11 == ne1) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
+                if (ne01 == ne0) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
 
                 if (backend_ctx->gpu_family == INTEL) {
 /*                    nth0 = 16; nth1 = 1; ndst = 8;
@@ -5609,7 +6481,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                     nth0 = 64; nth1 = 1; ndst = 8;
                     kernel = backend_ctx->kernel_mul_mat_q4_0_f32_1d_8x_flat;
                 } else {
-                    GGML_ASSERT(false && "TODO: Unknown GPU");
+                    if (false && "TODO: Unknown GPU") {
+                    } else {
+                        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                        qnn_op_bad = 1;
+                        return;
+                    }
                 }
 
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
@@ -5661,13 +6538,38 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         case GGML_TYPE_F32:{//
 //            GGML_ASSERT(ne02 == ne12);
             // матрица MxKxN
-            GGML_ASSERT(ne03 == ne13 && ne03==1);
+            if (ne03 == ne13 && ne03==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             // batch
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
 
-            GGML_ASSERT(src1t == GGML_TYPE_F32);
+            if (src1t == GGML_TYPE_F32) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             kernel = backend_ctx->kernel_mul_mat_f32_f32;
             nrows = 4;
 
@@ -5678,7 +6580,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 nth0 = 64;
                 nth1 = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d = _get_cl_buffer(src0, CL_MEM_READ_ONLY);
             B_d = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
@@ -5712,11 +6619,31 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         case GGML_TYPE_F16:{
 //            GGML_ASSERT(ne02 == ne12);
             // матрица MxKxN
-            GGML_ASSERT(ne03 == ne13 && ne03==1);
+            if (ne03 == ne13 && ne03==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             // batch
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32;
                 nth1 = 1;
@@ -5724,7 +6651,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 nth0 = 64;
                 nth1 = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
 
             if (src1t == GGML_TYPE_F32) {
@@ -5788,11 +6720,31 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         case GGML_TYPE_BF16:{
             // GGML_ASSERT(ne02 == ne12);
             // матрица MxKxN
-            GGML_ASSERT(ne03 == ne13 && ne03==1);
+            if (ne03 == ne13 && ne03==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             // batch
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32;ndst=1;
                 nth1 = 1;
@@ -5800,7 +6752,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 nth0 = 64;
                 nth1 = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
 /*            if (ne00 >= 128 && ne01 >= 8 && ne00%8 == 0) {
                 kernel = backend_ctx->kernel_mul_mat_bf16_f32_l4;// работает медленно и с ошибками
@@ -5842,8 +6799,18 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
             {
                 kernel = backend_ctx->kernel_mul_mat_bf16_f32;
                 nrows = 1;
-                GGML_ASSERT(ne11%nrows==0);
-                GGML_ASSERT(ne01%nrows==0);
+                if (ne11%nrows==0) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
+                if (ne01%nrows==0) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d = _get_cl_buffer(src0, CL_MEM_READ_ONLY);//_get_cl_buffer_sliced
             B_d = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
@@ -5873,16 +6840,46 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 
 		} break;
         case GGML_TYPE_Q8_0:{
-            GGML_ASSERT(ne12*ne13==1);// batch
-            GGML_ASSERT(ne02==1);   // 
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
 			if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32; nth1 = 1; ndst = 1;
 			}// INTEL
 			else {
-				GGML_ASSERT(false && "TODO: Unknown GPU");
+				if (false && "TODO: Unknown GPU") {
+				} else {
+				    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+				    qnn_op_bad = 1;
+				    return;
+				}
 			}
 
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
@@ -5915,11 +6912,36 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
             }
         } break;
         case GGML_TYPE_Q4_0:// ggml_is_matrix(src1);
-            GGML_ASSERT(ne12*ne13==1);// batch - для квантов не используется
-            GGML_ASSERT(ne02==1);   // 
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
 
 #ifdef GGML_OPENCL_SOA_Q
             if (backend_ctx->gpu_family == INTEL) {
@@ -5929,7 +6951,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 nth0 = 64; nth1 = 1; ndst =8;
                 kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
 
             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
@@ -5952,7 +6979,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 nth0 = 16; nth1 = 1; ndst = 1;
                 kernel = backend_ctx->kernel_mul_mat_q4_0_f32;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
 
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
@@ -5973,15 +7005,45 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 
         case GGML_TYPE_Q4_1:
 			kernel = backend_ctx->kernel_mul_mat_q4_1_f32;
-            GGML_ASSERT(ne12*ne13==1);// batch
-            GGML_ASSERT(ne02==1);   // 
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32; nth1 = 1; ndst = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
             B_d =_get_cl_buffer(src1,CL_MEM_READ_ONLY );
@@ -5999,19 +7061,54 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 			break;
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
-			GGML_ASSERT(false && "not implemented");
+			if (false && "not implemented") {
+			} else {
+			    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+			    qnn_op_bad = 1;
+			    return;
+			}
 			break;
         case GGML_TYPE_Q4_K:
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
-            GGML_ASSERT(ne12*ne13==1);// batch
-            GGML_ASSERT(ne02==1);   // 
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 1; nth1 = 32; ndst = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
             B_d =_get_cl_buffer(src1,CL_MEM_READ_ONLY );
@@ -6029,15 +7126,45 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
             break;
         case GGML_TYPE_Q5_K:
             kernel = backend_ctx->kernel_mul_mv_q5_K_f32;
-            GGML_ASSERT(ne12*ne13==1);// batch
-            GGML_ASSERT(ne02==1);   // 
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M dst[MxN]
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 1; nth1 = 32; ndst = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
             B_d =_get_cl_buffer(src1,CL_MEM_READ_ONLY );
@@ -6055,15 +7182,45 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 			break;
         case GGML_TYPE_Q6_K:
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
-            GGML_ASSERT(ne12*ne13==1);// batch
-            GGML_ASSERT(ne00==ne10);// K
-            GGML_ASSERT(ne01==ne0); // M
-            GGML_ASSERT(ne02==1);   // 1
-            GGML_ASSERT(ne11==ne1); // N
+            if (ne12*ne13==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne00==ne10) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne01==ne0) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne02==1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
+            if (ne11==ne1) {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 1; nth1 = 16; ndst = 1;
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
+                if (false && "TODO: Unknown GPU") {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                    qnn_op_bad = 1;
+                    return;
+                }
             }
             A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
             B_d =_get_cl_buffer(src1,CL_MEM_READ_ONLY );
@@ -6080,7 +7237,12 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
             CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_uint),      &ne1));
             break;
         default:
-            GGML_ASSERT(false && "not implemented");
+            if (false && "not implemented") {
+            } else {
+                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                qnn_op_bad = 1;
+                return;
+            }
     }
 
     if (src0t == GGML_TYPE_Q4_0 ||
@@ -6130,10 +7292,30 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 }
 
 static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_scale");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_scale");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_scale");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_scale");
+        qnn_op_bad = 1;
+        return;
+    }
     GGML_UNUSED(src1);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -6214,7 +7396,12 @@ static void ggml_cl_cpy_check(const ggml_tensor * src0, const ggml_tensor * src1
             dst->name,
             src1 ? src1->name : "-",
             dst->view_src ? dst->view_src->name : "-");
-        GGML_ASSERT(false && "cpy: wrong destination");
+        if (false && "cpy: wrong destination") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy_check");
+            qnn_op_bad = 1;
+            return;
+        }
     }
     static int nlog = 0;
     const char * name = dst && dst->name[0] ? dst->name : (src1 && src1->name[0] ? src1->name : "");
@@ -6243,10 +7430,30 @@ static void ggml_cl_cpy_check(const ggml_tensor * src0, const ggml_tensor * src1
 }
 
 static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy");
+        qnn_op_bad = 1;
+        return;
+    }
 
     // GGML_OP_CPY happens between src0 and src1.
     // GGML_OP_DUP and GGML_OP_CONT happen between src0 and dst.
@@ -6355,7 +7562,12 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     if (kernel == nullptr) {
         fprintf(stderr, "cpy no kernel %s -> %s\n",
             ggml_type_name(src0t), ggml_type_name(src1t));
-        GGML_ASSERT(false && "cpy: no kernel for this type pair");
+        if (false && "cpy: no kernel for this type pair") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_cpy");
+            qnn_op_bad = 1;
+            return;
+        }
     }
     ggml_cl_cpy_check(src0, src1, dst, fn);
 //    cl_mem A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
@@ -6442,10 +7654,30 @@ static void ggml_cl_dup(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 
 static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_diag_mask_inf");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_diag_mask_inf");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_diag_mask_inf");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_diag_mask_inf");
+        qnn_op_bad = 1;
+        return;
+    }
 
     UNUSED(src1);
 
@@ -6511,20 +7743,44 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
 }
 
 static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
 
     // Softmax can now fuse KQ mask and KQ scale, which used to be two additional
     // ops before softmax. It now also fuses alibi if `max_bias > 0`. For llama,
     // alibi is not used; however, for some other models, it is used.
     // KQ_mask
 
-    if (src1) // -- пока отключил
-    {
-        GGML_ASSERT(src1);
-        GGML_ASSERT(src1->extra);
+    if (src1) {
+        if (src1->extra) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+            qnn_op_bad = 1;
+            return;
+        }
+    } else {
     }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -6545,10 +7801,19 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
 //    __builtin_memcpy(&scale,    dst->op_params + 0, sizeof(float));
 //    __builtin_memcpy(&max_bias, dst->op_params + 1, sizeof(float));
 
-    GGML_ASSERT(max_bias==0);// в нашем случае так, от этого звисит выбор варианта функции softmax
+    if (max_bias==0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int nrows_x = ggml_nrows(src0);
     const int nrows_y = src0->ne[1];
+    if (nrows_y != 0 && ne00 != 0) {
+    } else {
+        return;
+    }
 
     const int n_head      = nrows_x/nrows_y;// ne[2]?
     const int n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
@@ -6576,17 +7841,29 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     else if (backend_ctx->gpu_family == ADRENO) {
         nth = 64;
     } else {
-        GGML_ASSERT(false && "TODO: Unknown GPU");
+        if (false && "TODO: Unknown GPU") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+            qnn_op_bad = 1;
+            return;
+        }
     }
 
-    cl_kernel kernel;
-    if (src1->type == GGML_TYPE_BF16) {
+    cl_kernel kernel = nullptr;
+    if (src1 == nullptr) {
+        kernel = backend_ctx->kernel_soft_max;
+    } else if (src1->type == GGML_TYPE_BF16) {
         kernel = backend_ctx->kernel_soft_max_bf16;
-    } else
-    if (src1->type == GGML_TYPE_F16) {
+    } else if (src1->type == GGML_TYPE_F16) {
         kernel = backend_ctx->kernel_soft_max_f16;
     } else {
         kernel = backend_ctx->kernel_soft_max;
+    }
+    if (kernel != nullptr) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
     }
     cl_mem A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
     cl_mem B_d =src1!=nullptr? _get_cl_buffer(src1,CL_MEM_READ_ONLY ): nullptr;
@@ -6623,12 +7900,42 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
 }
 
 static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0);
-    GGML_ASSERT(src0->extra);
-    GGML_ASSERT(src1);
-    GGML_ASSERT(src1->extra);
-    GGML_ASSERT(dst);
-    GGML_ASSERT(dst->extra);
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     cl_command_queue queue = backend_ctx->queue;
@@ -6666,8 +7973,18 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     if (ne02 == 0 || ne10 == 0) {
         return;
     } else {
-        GGML_ASSERT(ne10 % ne02 == 0);
-        GGML_ASSERT(ne10 >= ne02);
+        if (ne10 % ne02 == 0) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (ne10 >= ne02) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+            qnn_op_bad = 1;
+            return;
+        }
     }
 
     int nth = MIN(64, ne00);
@@ -6708,7 +8025,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
                 kernel = backend_ctx->kernel_rope_neox_f16;
                 break;
             default:
-                GGML_ASSERT(false);
+                if (false) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+                    qnn_op_bad = 1;
+                    return;
+                }
         };
     } else
     if (is_mrope && !is_vision) {
@@ -6720,7 +8042,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
                 kernel = backend_ctx->kernel_rope_multi_f16;
                 break;
             default:
-                GGML_ASSERT(false);
+                if (false) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+                    qnn_op_bad = 1;
+                    return;
+                }
         };
     } else 
     if (is_vision) {
@@ -6732,7 +8059,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
                 kernel = backend_ctx->kernel_rope_vision_f16;
                 break;
             default:
-                GGML_ASSERT(false);
+                if (false) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+                    qnn_op_bad = 1;
+                    return;
+                }
         }
     } else {
         switch (src0->type) {
@@ -6743,7 +8075,12 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
                 kernel = backend_ctx->kernel_rope_norm_f16;
                 break;
             default:
-                GGML_ASSERT(false);
+                if (false) {
+                } else {
+                    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+                    qnn_op_bad = 1;
+                    return;
+                }
         };
     }
     //GGML_ASSERT(extra2!=nullptr);
@@ -6815,16 +8152,67 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
-    GGML_ASSERT(q && q->extra);
-    GGML_ASSERT(k && k->extra);
-    GGML_ASSERT(v && v->extra);
-    GGML_ASSERT(dst->extra);
-    if (mask) GGML_ASSERT(mask->extra);
-    if (sinks) GGML_ASSERT(sinks->extra);
+    if (q && q->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (k && k->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (v && v->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (mask) {
+        if (mask->extra) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+            qnn_op_bad = 1;
+            return;
+        }
+    } else {
+    }
+    if (sinks) {
+        if (sinks->extra) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+            qnn_op_bad = 1;
+            return;
+        }
+    } else {
+    }
     if (kv_rows) {
-        GGML_ASSERT(kv_rows->extra);
-        GGML_ASSERT(kv_rows->type == GGML_TYPE_I32);
-        GGML_ASSERT(mask);
+        if (kv_rows->extra) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (kv_rows->type == GGML_TYPE_I32) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (mask) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+            qnn_op_bad = 1;
+            return;
+        }
     }
 
     const int n_q = q->ne[1];
@@ -6854,7 +8242,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         else if (is_f16) kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
         else kernel = backend_ctx->kernels_flash_attn_f32.at(dk_dv);
     }
-    GGML_ASSERT(kernel);
+    if (kernel) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *) q->extra;
     ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *) k->extra;
@@ -6959,15 +8352,40 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
 
 static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous_1(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+        qnn_op_bad = 1;
+        return;
+    }
     if (src0->ne[0] == 0 || ggml_nrows(src0) == 0) {
         return;
     }
     if (src1) {
-        GGML_ASSERT(src1->extra);
-        GGML_ASSERT(ggml_are_same_shape(src0, src1));
+        if (src1->extra) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (ggml_are_same_shape(src0, src1)) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+            qnn_op_bad = 1;
+            return;
+        }
     }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
@@ -6980,9 +8398,17 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
         case GGML_GLU_OP_SWIGLU_OAI:  kernel = backend_ctx->kernel_swiglu_oai; break;
         case GGML_GLU_OP_GEGLU_ERF:   kernel = dst->type == GGML_TYPE_F32 ? backend_ctx->kernel_geglu_erf : backend_ctx->kernel_geglu_erf_f16; break;
         case GGML_GLU_OP_GEGLU_QUICK: kernel = dst->type == GGML_TYPE_F32 ? backend_ctx->kernel_geglu_quick : backend_ctx->kernel_geglu_quick_f16; break;
-        default: GGML_ASSERT(0);
+        default: {
+            kernel = nullptr;
+            break;
+        }
     }
-    GGML_ASSERT(kernel);
+    if (kernel) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_glu");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
@@ -7029,12 +8455,42 @@ static void ggml_cl_glu(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 
 static void ggml_cl_dense_unary(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst, cl_kernel kernel) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(kernel);
-    GGML_ASSERT(src0->type == dst->type);
-    GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (kernel) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == dst->type) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous(src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous(dst)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_dense_unary");
+        qnn_op_bad = 1;
+        return;
+    }
     const size_t n = ggml_nelements(dst);
     if (n == 0) {
         return;
@@ -7070,7 +8526,12 @@ static void ggml_cl_sqr(ggml_backend_t backend, const ggml_tensor * src0, const 
     } else if (dst->type == GGML_TYPE_F16) {
         kernel = backend_ctx->kernel_sqr_f16;
     } else {
-        GGML_ASSERT(false && "SQR type");
+        if (false && "SQR type") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sqr");
+            qnn_op_bad = 1;
+            return;
+        }
     }
     ggml_cl_dense_unary(backend, src0, dst, kernel);
 }
@@ -7084,25 +8545,65 @@ static void ggml_cl_sqrt(ggml_backend_t backend, const ggml_tensor * src0, const
     } else if (dst->type == GGML_TYPE_F16) {
         kernel = backend_ctx->kernel_sqrt_f16;
     } else {
-        GGML_ASSERT(false && "SQRT type");
+        if (false && "SQRT type") {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sqrt");
+            qnn_op_bad = 1;
+            return;
+        }
     }
     ggml_cl_dense_unary(backend, src0, dst, kernel);
 }
 
 static void ggml_cl_sum_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(src1);
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
-    GGML_ASSERT(dst->ne[0] == 1);
-    GGML_ASSERT(dst->ne[1] == src0->ne[1] && dst->ne[2] == src0->ne[2] && dst->ne[3] == src0->ne[3]);
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->ne[0] == 1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->ne[1] == src0->ne[1] && dst->ne[2] == src0->ne[2] && dst->ne[3] == src0->ne[3]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int64_t nrows = dst->ne[1] * dst->ne[2] * dst->ne[3];
     if (nrows == 0) {
         return;
     }
-    GGML_ASSERT(src0->ne[1] > 0 && src0->ne[2] > 0);
+    if (src0->ne[1] > 0 && src0->ne[2] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sum_rows");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     cl_kernel kernel = backend_ctx->kernel_sum_rows;
@@ -7151,18 +8652,53 @@ static void ggml_cl_sum_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
 static void ggml_cl_mean(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(src1);
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
-    GGML_ASSERT(dst->ne[0] == 1 && src0->ne[0] > 0);
-    GGML_ASSERT(dst->ne[1] == src0->ne[1] && dst->ne[2] == src0->ne[2] && dst->ne[3] == src0->ne[3]);
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->ne[0] == 1 && src0->ne[0] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->ne[1] == src0->ne[1] && dst->ne[2] == src0->ne[2] && dst->ne[3] == src0->ne[3]) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int64_t nrows = dst->ne[1] * dst->ne[2] * dst->ne[3];
     if (nrows == 0) {
         return;
     }
-    GGML_ASSERT(src0->ne[1] > 0 && src0->ne[2] > 0);
+    if (src0->ne[1] > 0 && src0->ne[2] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mean");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     cl_kernel kernel = backend_ctx->kernel_mean;
@@ -7210,14 +8746,49 @@ static void ggml_cl_mean(ggml_backend_t backend, const ggml_tensor * src0, const
 
 static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(src1);
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(ggml_can_repeat(src0, dst));
-    GGML_ASSERT(src0->type == dst->type);
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_can_repeat(src0, dst)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == dst->type) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
     const size_t es = ggml_element_size(src0);
-    GGML_ASSERT(es == 2 || es == 4);
-    GGML_ASSERT(src0->nb[0] == es);
-    GGML_ASSERT(dst->nb[0] == es);
+    if (es == 2 || es == 4) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->nb[0] == es) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->nb[0] == es) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_repeat");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const size_t nelem = ggml_nelements(dst);
     if (nelem == 0) {
@@ -7266,14 +8837,39 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
 }
 
 static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(src1 && src1->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_div");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1 && src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_div");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_div");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_div");
+        qnn_op_bad = 1;
+        return;
+    }
     if (dst->ne[0] == 0 || dst->ne[1] == 0 || dst->ne[2] == 0 || dst->ne[3] == 0) {
         return;
     }
-    GGML_ASSERT(src1->ne[0] > 0 && src1->ne[1] > 0 && src1->ne[2] > 0 && src1->ne[3] > 0);
+    if (src1->ne[0] > 0 && src1->ne[1] > 0 && src1->ne[2] > 0 && src1->ne[3] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_div");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
@@ -7332,15 +8928,45 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 
 static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(src1 && src1->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_can_repeat(src1, src0));
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1 && src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_can_repeat(src1, src0)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
     if (dst->ne[0] == 0 || dst->ne[1] == 0 || dst->ne[2] == 0 || dst->ne[3] == 0) {
         return;
     }
-    GGML_ASSERT(src1->ne[0] > 0 && src1->ne[1] > 0 && src1->ne[2] > 0 && src1->ne[3] > 0);
+    if (src1->ne[0] > 0 && src1->ne[1] > 0 && src1->ne[2] > 0 && src1->ne[3] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_sub");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
@@ -7399,22 +9025,67 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const 
 }
 
 static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(src1 && src1->extra);
-    GGML_ASSERT(dst && dst->extra);
-    GGML_ASSERT(src0->type == src1->type && src0->type == dst->type);
-    GGML_ASSERT(!ggml_is_quantized(dst->type));
+    if (src0 && src0->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1 && src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst && dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src0->type == src1->type && src0->type == dst->type) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (!ggml_is_quantized(dst->type)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
     const int es = (int) ggml_element_size(dst);
-    GGML_ASSERT(es == 1 || es == 2 || es == 4 || es == 8);
-    GGML_ASSERT(dst->nb[0] == (size_t) es);
+    if (es == 1 || es == 2 || es == 4 || es == 8) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->nb[0] == (size_t) es) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
     const int dim = ggml_get_op_params_i32(dst, 0);
-    GGML_ASSERT(dim >= 0 && dim <= 3);
+    if (dim >= 0 && dim <= 3) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
 
     const int64_t nrows = dst->ne[1] * dst->ne[2] * dst->ne[3];
     if (nrows == 0) {
         return;
     }
-    GGML_ASSERT(dst->ne[1] > 0 && dst->ne[2] > 0);
+    if (dst->ne[1] > 0 && dst->ne[2] > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_concat");
+        qnn_op_bad = 1;
+        return;
+    }
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *) src0->extra;
@@ -7482,6 +9153,173 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clReleaseMemObject(md));
 }
 
+static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->type == GGML_TYPE_F32) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t s1 = ggml_get_op_params_i32(dst, 1);
+    const int32_t p0 = ggml_get_op_params_i32(dst, 2);
+    const int32_t p1 = ggml_get_op_params_i32(dst, 3);
+    const int32_t d0 = ggml_get_op_params_i32(dst, 4);
+    const int32_t d1 = ggml_get_op_params_i32(dst, 5);
+    const int32_t is_2d = ggml_get_op_params_i32(dst, 6);
+    if (is_2d == 0 || is_2d == 1) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (d0 > 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (d1 >= 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+
+    const cl_long IW = src1->ne[0];
+    const cl_long IH = is_2d ? src1->ne[1] : 1;
+    const cl_long IC = src1->ne[is_2d ? 2 : 1];
+    const cl_long KW = src0->ne[0];
+    const cl_long KH = is_2d ? src0->ne[1] : 1;
+    const cl_long OW = dst->ne[1];
+    const cl_long OH = is_2d ? dst->ne[2] : 1;
+    if (is_2d == 0) {
+        if (IH == 1) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (KH == 1) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+            qnn_op_bad = 1;
+            return;
+        }
+        if (OH == 1) {
+        } else {
+            GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+            qnn_op_bad = 1;
+            return;
+        }
+    }
+    const cl_long batch = src1->ne[is_2d ? 3 : 2];
+    const cl_long pelements = OW * KW * KH;
+    if (pelements == 0 || OH == 0 || IC == 0 || batch == 0) {
+        return;
+    }
+    // Шаг строки IW, канала IW*IH, плана IW*IH*IC. Отдельный nb ядру не нужен.
+    if (ggml_is_contiguous(src1)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (src1->nb[0] == sizeof(float)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (ggml_is_contiguous(dst)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_im2col");
+        qnn_op_bad = 1;
+        return;
+    }
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_im2col_f16 : backend_ctx->kernel_im2col_f32;
+    cl_mem src_mem = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
+    cl_mem dst_mem = _get_cl_buffer(dst, CL_MEM_WRITE_ONLY);
+
+    cl_uint u_IW = (cl_uint) IW;
+    cl_uint u_IH = (cl_uint) IH;
+    cl_uint u_IC = (cl_uint) IC;
+    cl_uint u_OW = (cl_uint) OW;
+    cl_uint u_OH = (cl_uint) OH;
+    cl_uint u_KW = (cl_uint) KW;
+    cl_uint u_KH = (cl_uint) KH;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),  &src_mem));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),  &dst_mem));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_uint), &u_IW));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_uint), &u_IH));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_uint), &u_IC));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_uint), &u_OW));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_uint), &u_OH));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_uint), &u_KW));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_uint), &u_KH));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),     &s0));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),     &s1));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),     &p0));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),     &p1));
+    cl_uint u_d0 = (cl_uint) d0;
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uint), &u_d0));
+    cl_uint u_d1 = (cl_uint) d1;
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_uint), &u_d1));
+
+    // Поток — одна позиция выходной строки. Плитку KW*KH ядро проходит само.
+    // Плоский случай сюда уже свёрнут: IH, KH, OH равны 1.
+    const size_t nth = 256;
+    size_t global_work_size[] = {((size_t) OW + nth - 1) / nth * nth, (size_t) OH, (size_t) batch * (size_t) IC};
+    size_t local_work_size[] = {nth, 1, 1};
+    cl_event event_list[GGML_MAX_SRC];
+    cl_uint event_list_len = _event_list(dst, event_list);
+    CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL, global_work_size, local_work_size,
+        event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
+    CL_CHECK(clReleaseMemObject(src_mem));
+    CL_CHECK(clReleaseMemObject(dst_mem));
+}
+
+
 static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor) {
     ggml_cl_func_t func = nullptr;
 
@@ -7542,11 +9380,11 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
         case GGML_OP_ADD:
             if (!any_on_device) {
                 return false;
+            } else if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+                func = ggml_cl_add;
+            } else {
+                return false;
             }
-            GGML_ASSERT(ggml_is_contiguous(src0));
-            GGML_ASSERT(ggml_is_contiguous(src1));
-
-            func = ggml_cl_add;
             break;
         case GGML_OP_MUL:
             if (!any_on_device) {
@@ -7724,10 +9562,27 @@ static bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor *
             }
             func = ggml_cl_repeat;
             break;
+        case GGML_OP_IM2COL:
+            if (ggml_nelements(tensor) == 0) {
+                return true;
+            }
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_im2col;
+            break;
         default:
             return false;
     }
 
-    func(backend, tensor->src[0], tensor->src[1], tensor);
-    return true;
+    if (func != nullptr) {
+        func(backend, tensor->src[0], tensor->src[1], tensor);
+    } else {
+        return false;
+    }
+    if (qnn_op_bad == 0 && qnn_cl_err == 0) {
+        return true;
+    } else {
+        return false;
+    }
 }

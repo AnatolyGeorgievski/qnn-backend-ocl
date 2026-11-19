@@ -33,117 +33,121 @@
 
 kernel void kernel_im2col_f32(
         global float * src1,
-        ulong offset1,
         global float * dst,
-        ulong offsetd,
-        ulong batch_offset,
-        ulong delta_offset,
-        long IW,
-        long IH,
-        long IC,
-        long OW,
-        long OH,
-        long KW,
-        long KH,
-        long pelements,
-        long CHW,
+        uint IW,
+        uint IH,
+        uint IC,
+        uint OW,
+        uint OH,
+        uint KW,
+        uint KH,
         int  s0,
         int  s1,
         int  p0,
         int  p1,
-        int  d0,
-        int  d1
+        uint d0,
+        uint d1
 ) {
-    // threadIdx.x + blockIdx.x * blockDim.x
-    long i = get_global_id(0);
-    if (i >= pelements) {
+    uint pos = get_global_id(0);
+    if (pos >= OW) {
         return;
     }
+    uint row = get_group_id(1);
+    uint im = get_group_id(2);
+    uint batch = im / IC;
+    uint ic = im % IC;
 
-    src1 = (global float*)((global char*)src1 + offset1);
-    dst = (global float*)((global char*)dst + offsetd);
+    // Сплошная картинка: шаг канала IW*IH, шаг плана IW*IH*IC. Хост это уже проверил.
+    uint wh = mul24(KH, KW);
+    uint src_base = mad24(batch, IC, ic);
+    src_base = mul24(src_base, IH);
+    src_base = mul24(src_base, IW);
 
-    long  ksize = OW * (KH > 1 ? KW : 1);
-    long  kx = i / ksize;
-    long  kd = kx * ksize;
-    long  ky = (i - kd) / OW;
-    long  ix = i % OW;
+    uint slot_base = mad24(batch, OH, row);
+    slot_base = mad24(slot_base, OW, pos);
+    slot_base = mul24(slot_base, mul24(IC, wh));
+    slot_base = mad24(ic, wh, slot_base);
 
-    long  oh = get_group_id(1);
-    long  batch = get_group_id(2) / IC;
-    long  ic = get_group_id(2) % IC;
+    int i0 = (int) pos * s0 - p0;
+    int j0 = (int) row * s1 - p1;
 
-    long iiw = ix * s0 + kx * d0 - p0;
-    long iih = oh * s1 + ky * d1 - p1;
-
-    long offset_dst =
-        ((batch * OH + oh) * OW + ix) * CHW +
-        (ic * (KW * KH) + ky * KW + kx);
-
-    if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
-        dst[offset_dst] = 0.0f;
-    } else {
-        long offset_src = ic * delta_offset + batch * batch_offset;
-        dst[offset_dst] = src1[offset_src + iih * IW + iiw];
+    for (uint ky = 0; ky < KH; ky++) {
+        uint dj = ky * d1;
+        int j = j0 + (int) dj;
+        uint slot_y = mad24(ky, KW, slot_base);
+        bool row_ok = j >= 0 && j < (int) IH;
+        uint src_y = 0;
+        if (row_ok) {
+            src_y = mad24((uint) j, IW, src_base);
+        }
+        for (uint kx = 0; kx < KW; kx++) {
+            uint di = kx * d0;
+            int i = i0 + (int) di;
+            bool in_bound = row_ok && i >= 0 && i < (int) IW;
+            dst[slot_y + kx] = in_bound ? src1[src_y + (uint) i] : 0.f;
+        }
     }
 }
+
 
 kernel void kernel_im2col_f16(
         global float * src1,
-        ulong offset1,
-        global half  * dst,
-        ulong offsetd,
-        ulong batch_offset,
-        ulong delta_offset,
-        long IW,
-        long IH,
-        long IC,
-        long OW,
-        long OH,
-        long KW,
-        long KH,
-        long pelements,
-        long CHW,
+        global half * dst,
+        uint IW,
+        uint IH,
+        uint IC,
+        uint OW,
+        uint OH,
+        uint KW,
+        uint KH,
         int  s0,
         int  s1,
         int  p0,
         int  p1,
-        int  d0,
-        int  d1
+        uint d0,
+        uint d1
 ) {
-    long i = get_global_id(0);
-
-    if (i >= pelements) {
+    uint pos = get_global_id(0);
+    if (pos >= OW) {
         return;
     }
+    uint row = get_group_id(1);
+    uint im = get_group_id(2);
+    uint batch = im / IC;
+    uint ic = im % IC;
 
-    src1 = (global float*)((global char*)src1 + offset1);
-    dst = (global half*)((global char*)dst + offsetd);
+    // Сплошная картинка: шаг канала IW*IH, шаг плана IW*IH*IC. Хост это уже проверил.
+    uint wh = mul24(KH, KW);
+    uint src_base = mad24(batch, IC, ic);
+    src_base = mul24(src_base, IH);
+    src_base = mul24(src_base, IW);
 
-    long  ksize = OW * (KH > 1 ? KW : 1);
-    long  kx = i / ksize;
-    long  kd = kx * ksize;
-    long  ky = (i - kd) / OW;
-    long  ix = i % OW;
+    uint slot_base = mad24(batch, OH, row);
+    slot_base = mad24(slot_base, OW, pos);
+    slot_base = mul24(slot_base, mul24(IC, wh));
+    slot_base = mad24(ic, wh, slot_base);
 
-    long  oh = get_group_id(1);
-    long  batch = get_group_id(2) / IC;
-    long  ic = get_group_id(2) % IC;
+    int i0 = (int) pos * s0 - p0;
+    int j0 = (int) row * s1 - p1;
 
-    long iiw = ix * s0 + kx * d0 - p0;
-    long iih = oh * s1 + ky * d1 - p1;
-
-    long offset_dst =
-        ((batch * OH + oh) * OW + ix) * CHW +
-        (ic * (KW * KH) + ky * KW + kx);
-
-    if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
-        dst[offset_dst] = 0.0f;
-    } else {
-        long offset_src = ic * delta_offset + batch * batch_offset;
-        dst[offset_dst] = src1[offset_src + iih * IW + iiw];
+    for (uint ky = 0; ky < KH; ky++) {
+        uint dj = ky * d1;
+        int j = j0 + (int) dj;
+        uint slot_y = mad24(ky, KW, slot_base);
+        bool row_ok = j >= 0 && j < (int) IH;
+        uint src_y = 0;
+        if (row_ok) {
+            src_y = mad24((uint) j, IW, src_base);
+        }
+        for (uint kx = 0; kx < KW; kx++) {
+            uint di = kx * d0;
+            int i = i0 + (int) di;
+            bool in_bound = row_ok && i >= 0 && i < (int) IW;
+            dst[slot_y + kx] = in_bound ? src1[src_y + (uint) i] : 0.f;
+        }
     }
 }
+
 #if 0
 // выделение плитки в колонку изображения
 kernel void im2col(
