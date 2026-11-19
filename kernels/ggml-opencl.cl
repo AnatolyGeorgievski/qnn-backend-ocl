@@ -815,18 +815,198 @@ kernel void kernel_mul(
     global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
     global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
     global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
-if(nb00==sizeof(float) && nb10==sizeof(float) && nb0==sizeof(float) && ne10%(get_max_sub_group_size())==0){// сделать отдельную функцию flat
-    for (uint i0 = sub_group_broadcast(get_local_id(0),0); i0 < ne0; i0 += get_local_size(0)) {
-        const int i10 = i0 % ne10;
-        float a = as_float(intel_sub_group_block_read((global uint*)(src0_ptr + i0*nb00)));
-        float b = as_float(intel_sub_group_block_read((global uint*)(src1_ptr + i10*nb10)));
-        intel_sub_group_block_write((global uint*)(dst_ptr + i0*nb0), as_uint(a*b));
-    }
-} else
+    // Блочная запись подгруппы требует выравнивания 512 байт. Строка в буфере
+    // начинается с 128. Произведение тогда чужое. Пишем своё число.
     for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
         const int i10 = i0 % ne10;
         *((global float *)(dst_ptr + i0*nb0)) = *((global float *)(src0_ptr + i0*nb00)) * *((global float *)(src1_ptr + i10*nb10));
     }
+}
+
+// Обратная величина, не деление. Один шаг Ньютона возвращает точность f32.
+inline float qnn_recip(float v) {
+    float r = native_recip(v);
+    return r * (2.f - v * r);
+}
+
+kernel void kernel_div(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        uint ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint ne10,
+        uint ne11,
+        uint ne12,
+        uint ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint ne0,
+        uint ne1,
+        uint ne2,
+        uint ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst + offsetd;
+
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        float a = *((global float *)(src0_ptr + i0*nb00));
+        float b = *((global float *)(src1_ptr + i10*nb10));
+        *((global float *)(dst_ptr + i0*nb0)) = a * qnn_recip(b);
+    }
+    (void) ne00; (void) ne01; (void) ne02; (void) ne03;
+    (void) ne1; (void) ne2; (void) ne3;
+}
+
+// SUB. src1 короче и повторяется. Индекс берётся по модулю его оси.
+kernel void kernel_sub(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        uint ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint ne10,
+        uint ne11,
+        uint ne12,
+        uint ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint ne0,
+        uint ne1,
+        uint ne2,
+        uint ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst + offsetd;
+
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        float a = *((global float *)(src0_ptr + i0*nb00));
+        float b = *((global float *)(src1_ptr + i10*nb10));
+        *((global float *)(dst_ptr + i0*nb0)) = a - b;
+    }
+    (void) ne00; (void) ne01; (void) ne02; (void) ne03;
+    (void) ne1; (void) ne2; (void) ne3;
+}
+
+// CONCAT. Одна нить — одна строка выхода. dim 0: хвост строки из src1. Иначе строка целиком из src0 или src1.
+kernel void kernel_concat(
+        global char * src0, ulong off0,
+        global char * src1, ulong off1,
+        global char * dst,  ulong offd,
+        int dim, int es,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb1, ulong nb2, ulong nb3,
+        int ne00, int ne01, int ne02, int ne03,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        int ne10,
+        ulong nb10, ulong nb11, ulong nb12, ulong nb13
+) {
+    int r = get_global_id(0);
+    int nrows = ne1 * ne2 * ne3;
+    if (r >= nrows) {
+        return;
+    }
+    int i1 = r % ne1;
+    int t  = r / ne1;
+    int i2 = t % ne2;
+    int i3 = t / ne2;
+
+    global char * y = dst + offd + (ulong) i1 * nb1 + (ulong) i2 * nb2 + (ulong) i3 * nb3;
+
+    if (dim == 0) {
+        global char * x0 = src0 + off0 + (ulong) i1 * nb01 + (ulong) i2 * nb02 + (ulong) i3 * nb03;
+        global char * x1 = src1 + off1 + (ulong) i1 * nb11 + (ulong) i2 * nb12 + (ulong) i3 * nb13;
+        for (int i = 0; i < ne00; ++i) {
+            for (int b = 0; b < es; ++b) {
+                y[(ulong) i * es + b] = x0[(ulong) i * nb00 + b];
+            }
+        }
+        y += (ulong) ne00 * es;
+        for (int i = 0; i < ne10; ++i) {
+            for (int b = 0; b < es; ++b) {
+                y[(ulong) i * es + b] = x1[(ulong) i * nb10 + b];
+            }
+        }
+        return;
+    }
+
+    int id = dim == 1 ? i1 : (dim == 2 ? i2 : i3);
+    int cut = dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03);
+    global char * x;
+    ulong nbx0;
+    if (id < cut) {
+        x = src0 + off0 + (ulong) i1 * nb01 + (ulong) i2 * nb02 + (ulong) i3 * nb03;
+        nbx0 = nb00;
+    } else {
+        int j1 = i1, j2 = i2, j3 = i3;
+        if (dim == 1) j1 = i1 - ne01;
+        else if (dim == 2) j2 = i2 - ne02;
+        else j3 = i3 - ne03;
+        x = src1 + off1 + (ulong) j1 * nb11 + (ulong) j2 * nb12 + (ulong) j3 * nb13;
+        nbx0 = nb10;
+    }
+    for (int i = 0; i < ne0; ++i) {
+        for (int b = 0; b < es; ++b) {
+            y[(ulong) i * es + b] = x[(ulong) i * nbx0 + b];
+        }
+    }
+    (void) ne1; (void) ne3; (void) ne00; (void) ne10;
 }
 // assumption: src1 is a row
 // broadcast src1 into src0
@@ -850,15 +1030,124 @@ kernel void kernel_mul_row(
 kernel void kernel_scale(
         global float8 * src0,
         global float8 * dst,
-        float scale
+        float scale,
+        float bias
 ) {
+    // Блок read8 хочет 512 байт. Смещение тензора кратно 128, выход scale
+    // попадал в чужие числа. Нить пишет свои 8. Сдвиг — второй параметр SCALE.
     uint gid = get_global_id(0);
-if (get_local_size(0)%get_max_sub_group_size()==0){
-    gid = sub_group_broadcast(gid,0);
-    float8 a = as_float8(intel_sub_group_block_read8((global uint*)(src0+gid)));
-    intel_sub_group_block_write8((global uint*)(dst+gid), as_uint8(a*scale));
-} else
-    dst[get_global_id(0)] = src0[get_global_id(0)] * scale;
+    dst[gid] = src0[gid] * scale + bias;
+}
+
+kernel void kernel_scale_strided(
+        global char * src,
+        global char * dst,
+        float scale,
+        float bias,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3
+) {
+    uint i = get_global_id(0);
+    uint n0 = ne0 > 0 ? (uint) ne0 : 1;
+    uint n1 = ne1 > 0 ? (uint) ne1 : 1;
+    uint n2 = ne2 > 0 ? (uint) ne2 : 1;
+    uint i0 = i % n0;
+    uint t  = i / n0;
+    uint i1 = t % n1;
+    t /= n1;
+    uint i2 = t % n2;
+    uint i3 = t / n2;
+    float x = *(global float *)(src + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+    *(global float *)(dst + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3) = x * scale + bias;
+    (void) ne3;
+}
+
+// REPEAT. dst[i] = src[i % ne_src]. Внутренняя ось сплошная, элемент 2 или 4 байта.
+kernel void kernel_repeat(
+        global char * src,
+        global char * dst,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb1, ulong nb2, ulong nb3,
+        int ne00, int ne01, int ne02, int ne03,
+        ulong nb01, ulong nb02, ulong nb03,
+        int es
+) {
+    ulong i = get_global_id(0);
+    ulong n0 = (ulong) ne0;
+    ulong n1 = (ulong) ne1;
+    ulong n2 = (ulong) ne2;
+    ulong n  = n0 * n1 * n2 * (ulong) ne3;
+    if (i >= n) {
+        return;
+    }
+    ulong i0 = i % n0;
+    ulong t  = i / n0;
+    ulong i1 = t % n1;
+    t /= n1;
+    ulong i2 = t % n2;
+    ulong i3 = t / n2;
+    ulong s0 = i0 % (ulong) ne00;
+    ulong s1 = i1 % (ulong) ne01;
+    ulong s2 = i2 % (ulong) ne02;
+    ulong s3 = i3 % (ulong) ne03;
+    global char * sp = src + s0 * (ulong) es + s1 * nb01 + s2 * nb02 + s3 * nb03;
+    global char * dp = dst + i0 * (ulong) es + i1 * nb1  + i2 * nb2  + i3 * nb3;
+    if (es == 4) {
+        *(global uint *) dp = *(global uint *) sp;
+    } else {
+        *(global ushort *) dp = *(global ushort *) sp;
+    }
+}
+
+// SUM_ROWS. Одна нить — одна строка, сумма по ne00. Порядок сложения как у CPU.
+kernel void kernel_sum_rows(
+        global char * src,
+        ulong off_s,
+        global char * dst,
+        ulong off_d,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb1, ulong nb2, ulong nb3
+) {
+    int r = get_global_id(0);
+    int i1 = r % ne01;
+    int t  = r / ne01;
+    int i2 = t % ne02;
+    int i3 = t / ne02;
+    global float * s = (global float *)(src + off_s + (ulong) i1 * nb01 + (ulong) i2 * nb02 + (ulong) i3 * nb03);
+    float sum = 0.f;
+    for (int i = 0; i < ne00; ++i) {
+        sum += s[i];
+    }
+    *(global float *)(dst + off_d + (ulong) i1 * nb1 + (ulong) i2 * nb2 + (ulong) i3 * nb3) = sum;
+}
+
+// MEAN. Та же сумма, делённая на длину строки. Порядок сложения как у CPU.
+kernel void kernel_mean(
+        global char * src,
+        ulong off_s,
+        global char * dst,
+        ulong off_d,
+        int ne00,
+        int ne01,
+        int ne02,
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb1, ulong nb2, ulong nb3
+) {
+    int r = get_global_id(0);
+    int i1 = r % ne01;
+    int t  = r / ne01;
+    int i2 = t % ne02;
+    int i3 = t / ne02;
+    global float * s = (global float *)(src + off_s + (ulong) i1 * nb01 + (ulong) i2 * nb02 + (ulong) i3 * nb03);
+    float sum = 0.f;
+    for (int i = 0; i < ne00; ++i) {
+        sum += s[i];
+    }
+    *(global float *)(dst + off_d + (ulong) i1 * nb1 + (ulong) i2 * nb2 + (ulong) i3 * nb3) = sum * (1.f / (float) ne00);
 }
 
 //------------------------------------------------------------------------------
@@ -922,6 +1211,29 @@ kernel void kernel_##op(            \
     type x = src0[gid];             \
     dst[gid] = op(x);               \
 }
+// Вид: шаг строки шире ne0. Линейный gid читает чужую полосу.
+#define KERNEL_UNARY_STRIDED(op, type)          \
+kernel void kernel_##op##_strided(              \
+        global char * src,                      \
+        global char * dst,                      \
+        int ne0, int ne1, int ne2, int ne3,     \
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03, \
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3) { \
+    uint i = get_global_id(0);                  \
+    uint n0 = ne0 > 0 ? (uint) ne0 : 1;         \
+    uint n1 = ne1 > 0 ? (uint) ne1 : 1;         \
+    uint n2 = ne2 > 0 ? (uint) ne2 : 1;         \
+    uint i0 = i % n0;                           \
+    uint t  = i / n0;                           \
+    uint i1 = t % n1;                           \
+    t /= n1;                                    \
+    uint i2 = t % n2;                           \
+    uint i3 = t / n2;                           \
+    global type * x = (global type *)(src + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03); \
+    global type * y = (global type *)(dst + i0*nb0  + i1*nb1  + i2*nb2  + i3*nb3); \
+    *y = op(*x);                                \
+    (void) ne3;                                 \
+}
 KERNEL_UNARY(silu_f16, half);
 KERNEL_UNARY(gelu_f16, half);
 KERNEL_UNARY(gelu_quick_f16, half);
@@ -977,6 +1289,20 @@ KERNEL_UNARY(atan, float);
 KERNEL_UNARY(sinh, float);
 KERNEL_UNARY(cosh, float);
 KERNEL_UNARY(tanh, float);
+KERNEL_UNARY_STRIDED(silu, float);
+KERNEL_UNARY_STRIDED(gelu, float);
+KERNEL_UNARY_STRIDED(relu, float);
+KERNEL_UNARY_STRIDED(elu, float);
+KERNEL_UNARY_STRIDED(hardswish, float);
+KERNEL_UNARY_STRIDED(hardsigmoid, float);
+KERNEL_UNARY_STRIDED(gelu_quick, float);
+KERNEL_UNARY_STRIDED(sigmoid, float);
+KERNEL_UNARY_STRIDED(op_sgn, float);
+KERNEL_UNARY_STRIDED(op_neg, float);
+KERNEL_UNARY_STRIDED(op_step, float);
+KERNEL_UNARY_STRIDED(fabs, float);
+KERNEL_UNARY_STRIDED(exp, float);
+KERNEL_UNARY_STRIDED(tanh, float);
 KERNEL_UNARY(ceil, float);
 KERNEL_UNARY(floor,float);
 KERNEL_UNARY(trunc,float);
@@ -987,7 +1313,11 @@ KERNEL_UNARY(rint, float);
 inline float8 OVERLOADABLE add(float8 u, float8 v){  return u+v; }
 inline float8 OVERLOADABLE sub(float8 u, float8 v){  return u-v; }
 inline float8 OVERLOADABLE mul(float8 u, float8 v){  return u*v; }
-inline float8 OVERLOADABLE div(float8 u, float8 v){  return u/v; }
+inline float8 OVERLOADABLE qnn_recip8(float8 v) {
+    float8 r = native_recip(v);
+    return r * ((float8)(2.f) - v * r);
+}
+inline float8 OVERLOADABLE div(float8 u, float8 v){  return u * qnn_recip8(v); }
 // синтез бинарных векторных операций: flat - совсем плоское представление, 
 // row - одна строка, повтор строк второго аргумента
 #define KERNEL_BINARY(op, type)                                     \
@@ -997,10 +1327,10 @@ kernel void kernel_##op##_flat(                                     \
         global type##8 * dst,                                       \
         uint ne                                                     \
 ) {                                                                 \
-    uint gid = sub_group_broadcast(get_global_id(0),0);             \
-    type##8 a = _sub_group_block_read((global type*)(src0+gid));    \
-    type##8 b = _sub_group_block_read((global type*)(src1+gid));    \
-    _sub_group_block_write((global float*)(dst+gid), (op(a,b)));    \
+    uint gid = get_global_id(0);                                    \
+    if (gid < ne) {                                                 \
+        dst[gid] = op(src0[gid], src1[gid]);                        \
+    }                                                               \
 }
 
 KERNEL_BINARY(add, float);
@@ -1457,10 +1787,13 @@ kernel void kernel_rms_norm(
         global float* dst,
         uint ne00,// число элементов
         uint nb01,
-        float eps
+        float eps,
+        local float * stripe
 ){
     // Обычный load. Блочное чтение подгруппы требует выравнивания 512 байт,
     // а строка в compute-буфере начинается не с него. Сумма тогда чужая.
+    // Свёртка группы на этой карте остаётся внутри подгруппы: у строки несколько
+    // масштабов, текст рассыпается. Полосы складываются в одну сумму.
     uint lid = get_local_id(0);
     uint r0  = get_group_id(0);
     global float * x = (global float *) ((global char *) src0 + (ulong) r0 * nb01);
@@ -1469,8 +1802,21 @@ kernel void kernel_rms_norm(
         float xi = x[i];
         sumf += xi * xi;
     }
-    sumf = work_group_reduce_add(sumf);
-    float scale = rsqrt(sumf / (float) ne00 + eps);
+    sumf = sub_group_reduce_add(sumf);
+    if (get_sub_group_local_id() == 0) {
+        stripe[get_sub_group_id()] = sumf;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float s = 0.f;
+        uint n = get_num_sub_groups();
+        for (uint k = 0; k < n; ++k) {
+            s += stripe[k];
+        }
+        stripe[0] = s;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    float scale = rsqrt(stripe[0] / (float) ne00 + eps);
     global float * y = (global float *) (dst + (ulong) r0 * ne00);
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
         y[i] = x[i] * scale;
@@ -2657,33 +3003,27 @@ kernel void kernel_cpy_f32_f16(
         ulong nb2,
         ulong nb3
 ) {
-    src0 = (global float*)((global char*)src0 + offset0);
-    dst = (global half*)((global char*)dst + offsetd);
-
-    uint i03 = get_group_id(2);
-    uint i02 = get_group_id(1);
-    uint i01 = get_group_id(0);
-
-    uint n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-
-    uint i3 = n / (ne2*ne1*ne0);
-    uint i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
-    uint i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
-    uint i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
-
-    global half * dst_data = (global half *)((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-/*
-if (nb00==sizeof(float) && ne00%8==0){// выделить в отдельную функцию
-    global float* src_data = (global float*)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01);
-    for (uint i = sub_group_broadcast(get_local_id(0),0); i < ne00/8; i += get_local_size(0)) {
-        float8 tmp = as_float8(intel_sub_group_block_read8((global uint*)src_data+i*8));
-        intel_sub_group_block_write_us8((global ushort*)dst_data+i*8, as_ushort8(convert_half8(tmp)));
+    // Один поток — один элемент. Прежняя сетка брала local=min(64, ne0)
+    // и закрывала только начало строки: хвост маски оставался не -inf.
+    const uint n01 = ne01 ? ne01 : 1;
+    const uint n02 = ne02 ? ne02 : 1;
+    const uint n03 = ne03 ? ne03 : 1;
+    const uint count = ne00 * n01 * n02 * n03;
+    const uint idx = get_global_id(0);
+    if (ne00 == 0 || idx >= count) {
+        return;
     }
-} else */
-    for (uint i = get_local_id(0); i < ne00; i += get_local_size(0)) {
-        global const float * src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i*nb00);
-        dst_data[i] = convert_half_rte(src[0]);
-    }
+    const uint i00 = idx % ne00;
+    uint t = idx / ne00;
+    const uint i01 = t % n01;
+    t /= n01;
+    const uint i02 = t % n02;
+    const uint i03 = t / n02;
+
+    const float v = *(global const float *)((global const char *)src0 + offset0
+        + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
+    *(global half *)((global char *)dst + offsetd
+        + i03*nb3 + i02*nb2 + i01*nb1 + i00*nb0) = convert_half_rte(v);
 }
 #if defined(cl_intel_bfloat16_conversions)
 kernel void kernel_cpy_bf16_f32(
@@ -2931,6 +3271,47 @@ kernel void kernel_get_rows_f32(
         y[ind] = x[ind];
 }
 
+kernel void kernel_get_rows_f32_strided(
+        global char * src0, ulong off0,
+        global char * rows, ulong off1,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint n_rows,
+        uint nb00,
+        uint nb01,
+        uint nb1
+) {
+    uint col = get_global_id(0);
+    uint row = get_global_id(1);
+    if (col >= ne00 || row >= n_rows) {
+        return;
+    }
+    int r = ((global int *)(rows + off1))[row];
+    global float * x = (global float *)(src0 + off0 + (size_t) r * nb01 + (size_t) col * nb00);
+    global float * y = (global float *)(dst + offd + (size_t) row * nb1 + (size_t) col * sizeof(float));
+    *y = *x;
+}
+
+kernel void kernel_get_rows_i32(
+        global void * src0,
+        global int * rows,
+        global void * dst,
+        uint ne00,
+        uint n_rows,
+        uint nb01,
+        uint nb1
+) {
+    uint col = get_global_id(0);
+    uint row = get_global_id(1);
+    if (col >= ne00 || row >= n_rows) {
+        return;
+    }
+    int r = rows[row];
+    global int * x = (global int *)((global char *) src0 + (size_t) r * nb01);
+    global int * y = (global int *)((global char *) dst + (size_t) row * nb1);
+    y[col] = x[col];
+}
+
 kernel void kernel_get_rows_f16(
         global void * src0,
         global uint * rows,
@@ -2943,21 +3324,16 @@ kernel void kernel_get_rows_f16(
         uint nb1,
         uint nb2
 ) {
-    uint i10 = get_group_id(0)*get_local_size(0);
-    uint i11 = get_group_id(1);
-
-    uint r = rows[i11]; //((global int32_t *) ((global char *) src1 + i11*nb11 + i10*nb10))[0];
-
-    uint i02 = i11;
-    global half8 *x = (global half8 *) ((global char *) src0 + r*nb01 + i02*nb02);
-    global float8 *y = (global float8 *) ((global char *) dst + i11*nb2 + i10*nb1);
-
-    for (uint ind = sub_group_broadcast(get_local_id(0),0); ind < ne00/8; ind += get_local_size(0)) {
-        half8 tmp = as_half8(intel_sub_group_block_read_us8((global ushort*)(x+ind)));
-        intel_sub_group_block_write8((global uint*)(y+ind), as_uint8(convert_float8(tmp)));        
-       // y[ind] = convert_float16(x[ind]);
+    // Один поток — один half. Блочный вариант писал только первые 8 чисел строки.
+    uint col = get_global_id(0);
+    uint row = get_global_id(1);
+    if (col >= ne00) {
+        return;
     }
-    // дописать остаток
+    int r = ((global int *)rows)[row];
+    half h = *(global half *)((global char *)src0 + (size_t)r * nb01 + (size_t)col * sizeof(half));
+    global float * y = (global float *)((global char *)dst + (size_t)row * nb1);
+    y[col] = (float)h;
 }
 
 kernel void kernel_get_rows_bf16(

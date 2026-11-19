@@ -24,6 +24,15 @@ inline float get_alibi_slope(
 
     return pow(base, exph);
 }
+
+inline int kv_rows_phys(const global int * rows, ulong rows_off, ulong rows_nb1, int batch, int col) {
+    if (rows == 0) {
+        return col;
+    }
+    const int r = ((const global int *)((const global char *)rows + rows_off + (ulong)batch * rows_nb1))[col];
+    return r < 0 ? 0 : r;
+}
+
 __kernel void flash_attn_f32(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -52,7 +61,10 @@ __kernel void flash_attn_f32(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset
+    const ulong sinks_offset,
+    const global int * kv_rows,
+    const ulong kv_rows_off,
+    const ulong kv_rows_nb1
 ) {
     const int tid = get_local_id(0);
     const int block_q_idx = get_group_id(0);
@@ -107,7 +119,7 @@ __kernel void flash_attn_f32(
             const int col = i % DK_VEC;
             const int k_row_idx = k_start + row;
             if (k_row_idx < n_kv) {
-                const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
+                const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + (ulong)kv_rows_phys(kv_rows, kv_rows_off, kv_rows_nb1, batch_idx, k_row_idx) * k_nb1;
                 l_k[row][col] = ((__global DATA_TYPE4*)(k_base + k_row_offset))[col];
             }
         }
@@ -116,7 +128,7 @@ __kernel void flash_attn_f32(
             const int col = i % DV_VEC;
             const int v_row_idx = k_start + row;
             if (v_row_idx < n_kv) {
-                const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
+                const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + (ulong)kv_rows_phys(kv_rows, kv_rows_off, kv_rows_nb1, batch_idx, v_row_idx) * v_nb1;
                 l_v[row][col] = ((__global DATA_TYPE4*)(v_base + v_row_offset))[col];
             }
         }
@@ -233,7 +245,10 @@ __kernel void flash_attn_f32_q1(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset
+    const ulong sinks_offset,
+    const global int * kv_rows,
+    const ulong kv_rows_off,
+    const ulong kv_rows_nb1
 ) {
     const int tid = get_local_id(0);
     const int head_batch_idx = get_global_id(1);
@@ -273,7 +288,7 @@ __kernel void flash_attn_f32_q1(
 
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + (ulong)kv_rows_phys(kv_rows, kv_rows_off, kv_rows_nb1, batch_idx, k_idx) * k_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
@@ -307,8 +322,8 @@ __kernel void flash_attn_f32_q1(
     ACC_TYPE l_i = 0.0f;
 
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
-        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + (ulong)kv_rows_phys(kv_rows, kv_rows_off, kv_rows_nb1, batch_idx, k_idx) * k_nb1;
+        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + (ulong)kv_rows_phys(kv_rows, kv_rows_off, kv_rows_nb1, batch_idx, k_idx) * v_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         const global DATA_TYPE4* v_ptr = (const global DATA_TYPE4*)(v_base + v_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
