@@ -713,7 +713,10 @@ kernel void kernel_add(
         ulong nb0,
         ulong nb1,
         ulong nb2,
-        ulong nb3
+        ulong nb3,
+        ulong off0,
+        ulong off1,
+        ulong offd
 ) {
     uint i03 = get_group_id(2);
     uint i02 = get_group_id(1);
@@ -723,9 +726,9 @@ kernel void kernel_add(
     uint i12 = i02 % ne12;
     uint i11 = i01 % ne11;
 
-    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
-    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
-    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    global char * src0_ptr = src0 + off0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + off1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + offd + i03*nb3  + i02*nb2  + i01*nb1;
 
     for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
         const uint i10 = i0 % ne10;
@@ -1156,6 +1159,7 @@ kernel void kernel_mean(
 #define GELU_QUICK_COEF -1.702f
 #define GELU_COEF_A     0.044715f
 #define SQRT_2_OVER_PI  0.79788456080286535587989211986876f
+#define SQRT_1_OVER_2   0.70710678118654752440084436210485f
 
 //------------------------------------------------------------------------------
 // silu, gelu, elu, sigmoid
@@ -1165,6 +1169,8 @@ inline float8 OVERLOADABLE silu(float8 x){  return x / (1.f + exp(-x)); }
 inline float  OVERLOADABLE gelu_quick(float x) { return x * (1.f / (1.f + exp(GELU_QUICK_COEF * x))); }
 inline float  OVERLOADABLE gelu(float  x){  return 0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x))); }
 inline float8 OVERLOADABLE gelu(float8 x){  return 0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x))); }
+inline float  OVERLOADABLE gelu_erf(float  x) { return 0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)); }
+inline float8 OVERLOADABLE gelu_erf(float8 x) { return 0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)); }
 inline float  OVERLOADABLE relu(float  x){  return fmax(0.f, x); }
 inline float8 OVERLOADABLE relu(float8 x){  return fmax(0.f, x); }
 inline float  OVERLOADABLE  elu(float  x){  return (x > 0.f) ? x : expm1(x); }
@@ -1173,6 +1179,10 @@ inline half  relu_f16(half  x){  return fmax(0.h, x); }
 inline half  gelu_f16(half  xh){  
     float x = xh;
     return convert_half_rte(0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x)))); }
+inline half gelu_erf_f16(half xh) {
+    float x = xh;
+    return convert_half_rte(0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)));
+}
 inline half  gelu_quick_f16(half xh) { 
     float x = xh;
     return convert_half_rte(x * (1.f / (1.f + exp(GELU_QUICK_COEF * x)))); }
@@ -1187,6 +1197,17 @@ inline half  sqrt_f16(half  x){  return half_sqrt(x); }
 inline half  fabs_f16(half  x){  return fabs(x); }
 inline half  sigmoid_f16(half x) { return native_recip((1.h + half_exp(-x))); }
 inline half step_f16(half  x)   { return  x > 0.h; }
+inline half expm1_f16(half xh) {
+    float x = xh;
+    return convert_half_rte(exp(x) - 1.f);
+}
+inline half floor_f16(half xh) { float x = xh; return convert_half_rte(floor(x)); }
+inline half ceil_f16(half xh)  { float x = xh; return convert_half_rte(ceil(x)); }
+inline half round_f16(half xh) { float x = xh; return convert_half_rte(round(x)); }
+inline half trunc_f16(half xh) { float x = xh; return convert_half_rte(trunc(x)); }
+inline half log_f16(half xh) { float x = xh; return convert_half_rte(log(x)); }
+inline half sin_f16(half xh) { float x = xh; return convert_half_rte(sin(x)); }
+inline half cos_f16(half xh) { float x = xh; return convert_half_rte(cos(x)); }
 inline half hardsigmoid_f16(half x){ return fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
 inline half hardswish_f16 (half x) { return x * fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
 
@@ -1236,6 +1257,7 @@ kernel void kernel_##op##_strided(              \
 }
 KERNEL_UNARY(silu_f16, half);
 KERNEL_UNARY(gelu_f16, half);
+KERNEL_UNARY(gelu_erf_f16, half);
 KERNEL_UNARY(gelu_quick_f16, half);
 KERNEL_UNARY(relu_f16, half);
 KERNEL_UNARY(fabs_f16, half);
@@ -1254,6 +1276,7 @@ KERNEL_UNARY(step_f16,   half);
 
 KERNEL_UNARY(silu, float);
 KERNEL_UNARY(gelu, float);
+KERNEL_UNARY(gelu_erf, float);
 KERNEL_UNARY(relu, float);
 KERNEL_UNARY(elu,  float);
 KERNEL_UNARY(hardswish, float);
@@ -1275,6 +1298,7 @@ KERNEL_UNARY(exp,  float);
 KERNEL_UNARY(exp2, float);
 KERNEL_UNARY(exp10,float);
 KERNEL_UNARY(expm1,float);
+KERNEL_UNARY_STRIDED(expm1, float);
 KERNEL_UNARY(log,  float);
 KERNEL_UNARY(log2, float);
 KERNEL_UNARY(log10,float);
@@ -1291,6 +1315,7 @@ KERNEL_UNARY(cosh, float);
 KERNEL_UNARY(tanh, float);
 KERNEL_UNARY_STRIDED(silu, float);
 KERNEL_UNARY_STRIDED(gelu, float);
+KERNEL_UNARY_STRIDED(gelu_erf, float);
 KERNEL_UNARY_STRIDED(relu, float);
 KERNEL_UNARY_STRIDED(elu, float);
 KERNEL_UNARY_STRIDED(hardswish, float);
@@ -1303,6 +1328,38 @@ KERNEL_UNARY_STRIDED(op_step, float);
 KERNEL_UNARY_STRIDED(fabs, float);
 KERNEL_UNARY_STRIDED(exp, float);
 KERNEL_UNARY_STRIDED(tanh, float);
+KERNEL_UNARY_STRIDED(silu_f16, half);
+KERNEL_UNARY_STRIDED(gelu_f16, half);
+KERNEL_UNARY_STRIDED(gelu_erf_f16, half);
+KERNEL_UNARY_STRIDED(gelu_quick_f16, half);
+KERNEL_UNARY_STRIDED(relu_f16, half);
+KERNEL_UNARY_STRIDED(fabs_f16, half);
+KERNEL_UNARY_STRIDED(tanh_f16, half);
+KERNEL_UNARY_STRIDED(exp_f16, half);
+KERNEL_UNARY_STRIDED(elu_f16, half);
+KERNEL_UNARY_STRIDED(sigmoid_f16, half);
+KERNEL_UNARY_STRIDED(hardsigmoid_f16, half);
+KERNEL_UNARY_STRIDED(hardswish_f16, half);
+KERNEL_UNARY_STRIDED(sgn_f16, half);
+KERNEL_UNARY_STRIDED(neg_f16, half);
+KERNEL_UNARY_STRIDED(step_f16, half);
+KERNEL_UNARY(expm1_f16, half);
+KERNEL_UNARY_STRIDED(expm1_f16, half);
+KERNEL_UNARY_STRIDED(floor, float);
+KERNEL_UNARY_STRIDED(ceil, float);
+KERNEL_UNARY_STRIDED(round, float);
+KERNEL_UNARY_STRIDED(trunc, float);
+KERNEL_UNARY(floor_f16, half);
+KERNEL_UNARY_STRIDED(floor_f16, half);
+KERNEL_UNARY(ceil_f16, half);
+KERNEL_UNARY_STRIDED(ceil_f16, half);
+KERNEL_UNARY(round_f16, half);
+KERNEL_UNARY_STRIDED(round_f16, half);
+KERNEL_UNARY(trunc_f16, half);
+KERNEL_UNARY_STRIDED(trunc_f16, half);
+KERNEL_UNARY(log_f16, half);
+KERNEL_UNARY(sin_f16, half);
+KERNEL_UNARY(cos_f16, half);
 KERNEL_UNARY(ceil, float);
 KERNEL_UNARY(floor,float);
 KERNEL_UNARY(trunc,float);
@@ -1522,14 +1579,14 @@ void blas_axpy(float* X, float* Y, uint N, uint offx,uint incx, uint offy,uint i
 }
 // L1 BLAS DOT product
 float blas_dot(float* X, float* Y, uint N, uint offx,uint incx, uint offy,uint incy, float alpha){
-    float sumf;
+    float sumf = 0.f;
     for(uint i = get_sub_group_local_id(); i<N; i+=get_max_sub_group_size())
         sumf += Y[offy + i*incy]*X[offx + i*incx];
     return sub_group_reduce_add(sumf);
 }
 // L1 BLAS NRM2 euclidean norm^2
 float blas_nrm2(float* X, float* Y, uint N, uint offx,uint incx, uint offy,uint incy, float alpha){
-    float sumf;
+    float sumf = 0.f;
     for(uint i = get_sub_group_local_id(); i<N; i+=get_max_sub_group_size()){
         float v = *(X + mad24(i, incx, offx));
         sumf += v*v;
@@ -1538,7 +1595,7 @@ float blas_nrm2(float* X, float* Y, uint N, uint offx,uint incx, uint offy,uint 
 }
 // L1 BLAS ASUM sum of absolute values
 float blas_asum(float* X, uint N, uint offx, uint incx){
-    float sumf;
+    float sumf = 0.f;
     for(uint i = get_sub_group_local_id(); i<N; i+=get_max_sub_group_size()){
         float v = *(float*)(X + mad24(i, incx, offx));
         sumf += fabs(v);
@@ -1725,57 +1782,83 @@ kernel void kernel_clamp(
     dst[gid] = op_clamp(src0[gid], min, max);
 }
 
+kernel void kernel_leaky_relu(
+        global float * src0,
+        global float * dst,
+        float slope
+) {
+    uint gid = get_global_id(0);
+    dst[gid] = op_leaky_relu(src0[gid], slope);
+}
+
+kernel void kernel_leaky_relu_f16(
+        global half * src0,
+        global half * dst,
+        float slope
+) {
+    uint gid = get_global_id(0);
+    float v = src0[gid];
+    float y = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
+    dst[gid] = convert_half_rte(y);
+}
+
 //------------------------------------------------------------------------------
 // norm
 //------------------------------------------------------------------------------
 kernel void kernel_norm(
-        global void * src0,
-        global float * dst,
-        int ne00,
-        ulong nb01,
+        global char * src0, ulong off0,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3,
         float eps,
         local float * sum
 ) {
-    global float * x = (global float *) ((global char *) src0 + get_group_id(0)*nb01);
+    uint lid = get_local_id(0);
+    uint r0 = get_group_id(0);
+    uint span = ne02 * ne01;
+    uint i03 = r0 / span;
+    uint i02 = (r0 - i03 * span) / ne01;
+    uint i01 = r0 - i03 * span - i02 * ne01;
+    global char * x = src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03;
+    global char * y = dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3;
 
-    // MEAN
-    // parallel sum
-    sum[get_local_id(0)] = 0.0f;
-    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        sum[get_local_id(0)] += x[i00];
+    sum[lid] = 0.0f;
+    for (uint i00 = lid; i00 < ne00; i00 += get_local_size(0)) {
+        sum[lid] += *(global float *)(x + (ulong) i00 * nb00);
     }
-    // reduce
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint i = get_local_size(0)/2; i > 0; i /= 2) {
-        if (get_local_id(0) < i) {
-            sum[get_local_id(0)] += sum[get_local_id(0) + i];
+        if (lid < i) {
+            sum[lid] += sum[lid + i];
+        } else {
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    float mean  = sum[0] / ne00;
+    float mean = sum[0] / (float) ne00;
 
-    // recenter and VARIANCE
     barrier(CLK_LOCAL_MEM_FENCE);
-    global float * y = dst + get_group_id(0)*ne00;
-    sum[get_local_id(0)] = 0.0f;
-    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        y[i00] = x[i00] - mean;
-        sum[get_local_id(0)] += y[i00] * y[i00];
+    sum[lid] = 0.0f;
+    for (uint i00 = lid; i00 < ne00; i00 += get_local_size(0)) {
+        float d = *(global float *)(x + (ulong) i00 * nb00) - mean;
+        *(global float *)(y + (ulong) i00 * nb0) = d;
+        sum[lid] += d * d;
     }
-
-    // reduce
     barrier(CLK_LOCAL_MEM_FENCE);
     for (uint i = get_local_size(0)/2; i > 0; i /= 2) {
-        if (get_local_id(0) < i) {
-            sum[get_local_id(0)] += sum[get_local_id(0) + i];
+        if (lid < i) {
+            sum[lid] += sum[lid + i];
+        } else {
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    float variance = sum[0] / ne00;
-
-    float scale = 1.0f/sqrt(variance + eps);
-    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        y[i00] = y[i00] * scale;
+    float variance = sum[0] / (float) ne00;
+    float scale = 1.0f / sqrt(variance + eps);
+    for (uint i00 = lid; i00 < ne00; i00 += get_local_size(0)) {
+        global float * yp = (global float *)(y + (ulong) i00 * nb0);
+        *yp = *yp * scale;
     }
 }
 
@@ -1783,10 +1866,13 @@ kernel void kernel_norm(
 // rms_norm
 //------------------------------------------------------------------------------
 kernel void kernel_rms_norm(
-        global void * src0,
-        global float* dst,
-        uint ne00,// число элементов
-        uint nb01,
+        global char * src0, ulong off0,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb1, ulong nb2, ulong nb3,
         float eps,
         local float * stripe
 ){
@@ -1796,7 +1882,11 @@ kernel void kernel_rms_norm(
     // масштабов, текст рассыпается. Полосы складываются в одну сумму.
     uint lid = get_local_id(0);
     uint r0  = get_group_id(0);
-    global float * x = (global float *) ((global char *) src0 + (ulong) r0 * nb01);
+    uint span = ne02 * ne01;
+    uint i03 = r0 / span;
+    uint i02 = (r0 - i03 * span) / ne01;
+    uint i01 = r0 - i03 * span - i02 * ne01;
+    global float * x = (global float *) (src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
     float sumf = 0.f;
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
         float xi = x[i];
@@ -1805,6 +1895,7 @@ kernel void kernel_rms_norm(
     sumf = sub_group_reduce_add(sumf);
     if (get_sub_group_local_id() == 0) {
         stripe[get_sub_group_id()] = sumf;
+    } else {
     }
     work_group_barrier(CLK_LOCAL_MEM_FENCE);
     if (lid == 0) {
@@ -1814,10 +1905,11 @@ kernel void kernel_rms_norm(
             s += stripe[k];
         }
         stripe[0] = s;
+    } else {
     }
     work_group_barrier(CLK_LOCAL_MEM_FENCE);
     float scale = rsqrt(stripe[0] / (float) ne00 + eps);
-    global float * y = (global float *) (dst + (ulong) r0 * ne00);
+    global float * y = (global float *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
         y[i] = x[i] * scale;
     }
@@ -2928,6 +3020,46 @@ kernel void kernel_cpy_f16_f16(
     }
 }
 
+kernel void kernel_cpy_i16_i16(
+        global short * src0,
+        ulong offset0,
+        global short * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global short *)((global char *) src0 + offset0);
+    dst  = (global short *)((global char *) dst + offsetd);
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0);
+    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
+    int i3 = n / (ne2*ne1*ne0);
+    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
+    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
+    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
+    global short * dst_data = (global short *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
+        global const short * src = (global short *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
+        dst_data[i00] = src[0];
+    }
+}
+
 kernel void kernel_cpy_f16_f32(
         global half * src0,
         ulong offset0,
@@ -2969,7 +3101,7 @@ kernel void kernel_cpy_f16_f32(
 if (nb00==sizeof(half) && ne00%8==0){// выделить в отдельную функцию
     global half* src_data = (global half*)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01);
     for (uint i = sub_group_broadcast(get_local_id(0),0); i < ne00/8; i += get_local_size(0)) {
-        half8 tmp = as_half8(intel_sub_group_block_read_us8((global ushort*)src0+i*8));
+        half8 tmp = as_half8(intel_sub_group_block_read_us8((global ushort*)(src_data + i*8)));
         //half16 tmp = vload16(i, src_data);
         //vstore16(convert_float16(tmp), i, dst_data);
         intel_sub_group_block_write8((global uint*)dst_data+i*8, as_uint8(convert_float8(tmp)));
@@ -3237,9 +3369,9 @@ if (nb00==sizeof(float) && ne00%get_max_sub_group_size()==0){// выделить
         intel_sub_group_block_write((global uint*)(dst_data+i), tmp);
     }
 } else */
-    uint stride = nb00/4;
-    for (uint i = get_local_id(0); i < ne00; i += get_local_size(0)) {
-        dst_data[i] = src_data[i*stride];
+    for (uint i = get_local_id(0); i < (uint) ne00; i += get_local_size(0)) {
+        *(global float *)((global char *) dst_data + (ulong) i * nb0) =
+            *(global float *)((global char *) src_data + (ulong) i * nb00);
     }
 }
 
@@ -3276,20 +3408,26 @@ kernel void kernel_get_rows_f32_strided(
         global char * rows, ulong off1,
         global char * dst,  ulong offd,
         uint ne00,
+        uint ne10,
+        uint ne11,
         uint n_rows,
-        uint nb00,
-        uint nb01,
-        uint nb1
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb10, ulong nb11, ulong nb12,
+        ulong nb1, ulong nb2, ulong nb3
 ) {
     uint col = get_global_id(0);
-    uint row = get_global_id(1);
-    if (col >= ne00 || row >= n_rows) {
-        return;
+    uint i = get_global_id(1);
+    if (col < ne00 && i < n_rows) {
+        uint span = ne11 * ne10;
+        uint i12 = i / span;
+        uint i11 = (i - i12 * span) / ne10;
+        uint i10 = i - i12 * span - i11 * ne10;
+        int r = *(global int *)(rows + off1 + (ulong) i10 * nb10 + (ulong) i11 * nb11 + (ulong) i12 * nb12);
+        global float * x = (global float *)(src0 + off0 + (ulong) r * nb01 + (ulong) i11 * nb02 + (ulong) i12 * nb03 + (ulong) col * sizeof(float));
+        global float * y = (global float *)(dst + offd + (ulong) i10 * nb1 + (ulong) i11 * nb2 + (ulong) i12 * nb3 + (ulong) col * sizeof(float));
+        *y = *x;
+    } else {
     }
-    int r = ((global int *)(rows + off1))[row];
-    global float * x = (global float *)(src0 + off0 + (size_t) r * nb01 + (size_t) col * nb00);
-    global float * y = (global float *)(dst + offd + (size_t) row * nb1 + (size_t) col * sizeof(float));
-    *y = *x;
 }
 
 kernel void kernel_get_rows_i32(
@@ -3695,7 +3833,7 @@ kernel void kernel_mul_mat_f16_f16(
             global half * y = (global half *) (src1 + offset_src1);
 
             float sumf = 0;
-            for (uint i = get_sub_group_local_id(); i < ne00/4; i += get_max_sub_group_size()) {
+            for (uint i = get_sub_group_local_id(); i < (uint) ne00; i += get_max_sub_group_size()) {
                 sumf += (half) x[i] * (half) y[i];
             }
 
@@ -4619,8 +4757,10 @@ inline void mul_vec_q_n_f32_flat(
     }
     for (uint row = 0; row < N_DST; ++row) {
         sumf[row] = sub_group_reduce_add(sumf[row]);
-        if (get_sub_group_local_id() == 0/* && first_row + row < ne01*/) 
+        if (get_sub_group_local_id() == 0 && first_row + row < ne01) {
             dst[(r1 + im*ne1)*ne0 + first_row + row] = sumf[row];
+        } else {
+        }
     }
 }
 

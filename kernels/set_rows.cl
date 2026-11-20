@@ -187,3 +187,115 @@ kernel void kernel_set_rows_f16_i32(
         dst_row[ind] = src_row[ind];
     }
 }
+
+kernel void kernel_set_rows_f16src_f32_i64(
+        global char * src0, ulong offset0,
+        global char * src1, ulong offset1,
+        global char * dst,  ulong offsetd,
+        int ne01, ulong nb01, ulong nb02, ulong nb03,
+        int ne11, int ne12, ulong nb10, ulong nb11, ulong nb12,
+        int nblk0, ulong nb1, ulong nb2, ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+    if (i01 >= ne01) {
+        return;
+    } else {
+    }
+    int i12 = i03 % ne12;
+    int i11 = i02 % ne11;
+    long i1 = ((global long *)(src1 + (ulong) i01 * nb10 + (ulong) i11 * nb11 + (ulong) i12 * nb12))[0];
+    global float * dst_row = (global float *)(dst + (ulong) i1 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    global half  * src_row = (global half  *)(src0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
+        dst_row[ind] = (float) src_row[ind];
+    }
+}
+
+kernel void kernel_set_rows_f16src_f16_i64(
+        global char * src0, ulong offset0,
+        global char * src1, ulong offset1,
+        global char * dst,  ulong offsetd,
+        int ne01, ulong nb01, ulong nb02, ulong nb03,
+        int ne11, int ne12, ulong nb10, ulong nb11, ulong nb12,
+        int nblk0, ulong nb1, ulong nb2, ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+    if (i01 >= ne01) {
+        return;
+    } else {
+    }
+    int i12 = i03 % ne12;
+    int i11 = i02 % ne11;
+    long i1 = ((global long *)(src1 + (ulong) i01 * nb10 + (ulong) i11 * nb11 + (ulong) i12 * nb12))[0];
+    global half * dst_row = (global half *)(dst + (ulong) i1 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    global half * src_row = (global half *)(src0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
+        dst_row[ind] = src_row[ind];
+    }
+}
+
+kernel void kernel_set_rows_f16src_f32_i32(
+        global char * src0, ulong offset0,
+        global char * src1, ulong offset1,
+        global char * dst,  ulong offsetd,
+        int ne01, ulong nb01, ulong nb02, ulong nb03,
+        int ne11, int ne12, ulong nb10, ulong nb11, ulong nb12,
+        int nblk0, ulong nb1, ulong nb2, ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+    if (i01 >= ne01) {
+        return;
+    } else {
+    }
+    int i12 = i03 % ne12;
+    int i11 = i02 % ne11;
+    int i1 = ((global int *)(src1 + (ulong) i01 * nb10 + (ulong) i11 * nb11 + (ulong) i12 * nb12))[0];
+    global float * dst_row = (global float *)(dst + (ulong) i1 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    global half  * src_row = (global half  *)(src0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
+        dst_row[ind] = (float) src_row[ind];
+    }
+}
+
+kernel void kernel_set_rows_f16src_f16_i32(
+        global char * src0, ulong offset0,
+        global char * src1, ulong offset1,
+        global char * dst,  ulong offsetd,
+        int ne01, ulong nb01, ulong nb02, ulong nb03,
+        int ne11, int ne12, ulong nb10, ulong nb11, ulong nb12,
+        int nblk0, ulong nb1, ulong nb2, ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+    if (i01 >= ne01) {
+        return;
+    } else {
+    }
+    int i12 = i03 % ne12;
+    int i11 = i02 % ne11;
+    int i1 = ((global int *)(src1 + (ulong) i01 * nb10 + (ulong) i11 * nb11 + (ulong) i12 * nb12))[0];
+    global half * dst_row = (global half *)(dst + (ulong) i1 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    global half * src_row = (global half *)(src0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
+        dst_row[ind] = src_row[ind];
+    }
+}
