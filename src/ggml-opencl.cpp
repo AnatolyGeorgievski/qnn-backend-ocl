@@ -2327,7 +2327,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             const struct { int dk; int dv; } dims[] = {
                 { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
                 {112, 112}, {128, 128}, {192, 128},
-                {192, 192}, {256, 256},
+                {192, 192}, {256, 256}, {512, 512},
             };
             bool ok = false;
             for (size_t i = 0; i < sizeof(dims)/sizeof(dims[0]); ++i) {
@@ -6295,12 +6295,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     const cl_uint  ne01 = src0->ne[1];
     const cl_uint  ne02 = src0->ne[2];
     const cl_uint  ne03 = src0->ne[3];
-if (ne03==1) {
-} else {
-    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-    qnn_op_bad = 1;
-    return;
-}
 
     const cl_ulong nb00 = src0->nb[0];
     const cl_ulong nb01 = src0->nb[1];
@@ -6314,12 +6308,6 @@ if (ne03==1) {
     const cl_uint  ne12 = src1->ne[2];
     const cl_uint  ne13 = src1->ne[3];
 
-if (ne13==1) {
-} else {
-    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-    qnn_op_bad = 1;
-    return;
-}
 
     const cl_ulong nb10 = src1->nb[0];
     const cl_ulong nb11 = src1->nb[1];
@@ -6329,15 +6317,14 @@ if (ne13==1) {
     const cl_uint  ne0 = dst->ne[0];
     const cl_uint  ne1 = dst->ne[1];
 // кратность
-    cl_uint r2 = ne12/ne02;
-    cl_uint r3 = ne13/ne03;
-
-    if (r3 == 1) {
+    if (ne02 > 0 && ne03 > 0 && ne12 % ne02 == 0 && ne13 % ne03 == 0) {
     } else {
         GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
         qnn_op_bad = 1;
         return;
     }
+    cl_uint r2 = ne12/ne02;
+    cl_uint r3 = ne13/ne03;
     if (ne00 == ne10) {
     } else {
         GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
@@ -6679,12 +6666,6 @@ if (!ggml_is_transposed(src1) && "src1 transposed") {
     qnn_op_bad = 1;
     return;
 }
-if (src0->ne[3] == 1 && src1->ne[3] == 1) {
-} else {
-    GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-    qnn_op_bad = 1;
-    return;
-}
 if (src0->ne[0] == src1->ne[0]) {
 } else {
     GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
@@ -6734,40 +6715,14 @@ if (src0->ne[0]*src0->nb[0]<src0->nb[1] && src0->nb[2]==src0->ne[1]*src0->nb[1])
         qnn_op_bad = 1;
         return;
     }
-    if (src0->ne[3]==1) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
 // range = src0->nb[3];
-} else if (ggml_is_permuted(src0)) {// `nb[0]==_type_size()` AND `nb[1]==ne[2]*nb[2]`
+} else if (ggml_is_permuted(src0)) {
     if (src0->nb[0]==ggml_type_size(src0->type)) {
     } else {
         GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
         qnn_op_bad = 1;
         return;
     }
-    if (src0->nb[2]==src0->ne[0]*src0->nb[0]) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
-    if (src0->nb[1]==src0->ne[2]*src0->nb[2]) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
-//    GGML_ASSERT(src0->nb[3]==src0->ne[1]*src0->nb[1]);
-    if (ggml_is_3d(src1)) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
-//    GGML_ASSERT(0 && "permuted");
 } else {
     if (1) printf("MM %s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu,%zu)%c %s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu)%c->%s(%zu,%zu,%zu,%zu)(%zu,%zu,%zu)%c\n", 
         src0->name, src0->ne[0], src0->ne[1], src0->ne[2],src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2],src0->nb[3], ggml_is_contiguous(src0)?'c': ggml_is_permuted(src0)?'p':'n',
@@ -6814,12 +6769,6 @@ if (src1->ne[0]*src1->nb[0]==src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         qnn_op_bad = 1;
         return;
     }
-    if (src1->ne[3]==1) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
 } else 
 if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]) {// submatrx - содержит подстроки
     if (src1->nb[0]==ggml_type_size(src1->type)) {
@@ -6834,26 +6783,8 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         qnn_op_bad = 1;
         return;
     }
-    if (src1->ne[3]==1) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
 } else if (ggml_is_permuted(src1)) {
     if (src1->nb[0]==ggml_type_size(src1->type)) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
-    if (src1->nb[1]==src1->ne[2]*src1->nb[2]) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-        qnn_op_bad = 1;
-        return;
-    }
-    if (src1->ne[3]==1) {
     } else {
         GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
         qnn_op_bad = 1;
@@ -6960,13 +6891,6 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         case GGML_TYPE_F32:{//
 //            GGML_ASSERT(ne02 == ne12);
             // матрица MxKxN
-            if (ne03 == ne13 && ne03==1) {
-            } else {
-                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
-                qnn_op_bad = 1;
-                return;
-            }
-            // batch
             if (ne00==ne10) {
             } else {
                 GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
@@ -8236,35 +8160,32 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
 //    __builtin_memcpy(&scale,    dst->op_params + 0, sizeof(float));
 //    __builtin_memcpy(&max_bias, dst->op_params + 1, sizeof(float));
 
-    if (max_bias==0) {
-    } else {
-        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
-        qnn_op_bad = 1;
-        return;
-    }
-
-    const int nrows_x = ggml_nrows(src0);
     const int nrows_y = src0->ne[1];
     if (nrows_y != 0 && ne00 != 0) {
     } else {
         return;
     }
 
-    const int n_head      = nrows_x/nrows_y;// ne[2]?
-    const int n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
+    const int n_head      = (int) ne02;
+    const int n_head_log2 = n_head > 0 ? (int) (1u << (uint32_t) floorf(log2f((float) n_head))) : 1;
 
-    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
-    float slope = 1.f;
-    if (src1 == nullptr) {
-        slope = 0.f;
-    } else if (max_bias > 0.0f) {
-        int h = ne02;
-
-        float base = h < n_head_log2 ? m0 : m1;
-        int   exp  = h < n_head_log2 ? h + 1 : 2*(h - n_head_log2) + 1;
-
-        slope = pow(base, exp);
+    const int n_log2 = n_head_log2 > 0 ? n_head_log2 : 1;
+    const float m0 = powf(2.0f, -(max_bias       ) / n_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_log2);
+    const ggml_tensor * src2 = dst->src[2];
+    const int has_mask = src1 != nullptr;
+    const int has_sinks = src2 != nullptr;
+    if (src2 == nullptr || src2->extra) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_soft_max");
+        qnn_op_bad = 1;
+        return;
+    }
+    cl_uint ne12 = 1;
+    cl_uint ne13 = 1;
+    if (src1) {
+        ne12 = src1->ne[2] > 0 ? (cl_uint) src1->ne[2] : 1;
+        ne13 = src1->ne[3] > 0 ? (cl_uint) src1->ne[3] : 1;
     } else {
     }
 
@@ -8306,19 +8227,25 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_mem A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
     cl_mem B_d =src1!=nullptr? _get_cl_buffer(src1,CL_MEM_READ_ONLY ): nullptr;
     cl_mem C_d =_get_cl_buffer(dst, CL_MEM_WRITE_ONLY);
+    cl_mem S_d = src2 ? _get_cl_buffer(src2, CL_MEM_READ_ONLY) : A_d;
+    const cl_uint nlog2 = (cl_uint) n_log2;
 
-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_d));//extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   B_d!=nullptr? &B_d: &A_d));//extra1 ? &extra1->data_device : &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &C_d));//extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_uint),      &ne00));
-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_uint),      &ne01));
-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_uint),      &ne02));
-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_float),    &scale));
-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_float),    &slope));
-//    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(float),    &max_bias));
-//    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(float),    &m0));
-//    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(float),    &m1));
-//    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &n_head_log2));
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_d));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   B_d!=nullptr? &B_d: &A_d));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &C_d));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &S_d));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_uint),  &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_uint),  &ne01));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_uint),  &ne02));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_uint),  &ne12));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_uint),  &ne13));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_float), &scale));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_float), &max_bias));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_float), &m0));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_float), &m1));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uint),  &nlog2));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &has_mask));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &has_sinks));
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
     size_t  local_work_size[] = {(size_t)nth, 1, 1};
@@ -8335,6 +8262,10 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clReleaseMemObject(A_d));
     if (B_d!=nullptr) CL_CHECK(clReleaseMemObject(B_d));
     CL_CHECK(clReleaseMemObject(C_d));
+    if (src2) {
+        CL_CHECK(clReleaseMemObject(S_d));
+    } else {
+    }
 }
 
 static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -8521,43 +8452,68 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
                 }
         };
     }
-    //GGML_ASSERT(extra2!=nullptr);
-    cl_mem A_d =_get_cl_buffer(src0,CL_MEM_READ_ONLY );
-    cl_mem B_d =_get_cl_buffer(src1,CL_MEM_READ_ONLY );
-    cl_mem C_d = extra2? _get_cl_buffer(src2,CL_MEM_READ_ONLY ): nullptr;
-    cl_mem D_d =_get_cl_buffer(dst, CL_MEM_WRITE_ONLY);
+    if ((uintptr_t) src0->data >= (uintptr_t) cl_ptr_base
+     && (uintptr_t) src1->data >= (uintptr_t) cl_ptr_base
+     && (uintptr_t) dst->data  >= (uintptr_t) cl_ptr_base
+     && (src2 == nullptr || (uintptr_t) src2->data >= (uintptr_t) cl_ptr_base)) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_rope");
+        qnn_op_bad = 1;
+        return;
+    }
+    ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * e1 = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
+    cl_mem A_d = e0->data_device;
+    cl_mem B_d = e1->data_device;
+    cl_mem D_d = ed->data_device;
+    cl_mem C_d = extra2 ? extra2->data_device : A_d;
+    const cl_ulong off0 = (cl_ulong) ((uintptr_t) src0->data - (uintptr_t) cl_ptr_base);
+    const cl_ulong off1 = (cl_ulong) ((uintptr_t) src1->data - (uintptr_t) cl_ptr_base);
+    const cl_ulong offd = (cl_ulong) ((uintptr_t) dst->data - (uintptr_t) cl_ptr_base);
+    const cl_ulong off2 = src2 ? (cl_ulong) ((uintptr_t) src2->data - (uintptr_t) cl_ptr_base) : off0;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &A_d));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &B_d));
-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   C_d!=nullptr?&C_d:&A_d));//extra2 ? &extra2->data_device : &extra0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &C_d));
     CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &D_d));
-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &ne01));
-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne02));
-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne03));
-    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb00));
-    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb01));
-    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb02));
-    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb03));
-    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne0));
-    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne1));
-    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne2));
-    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne3));
-    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb0));
-    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb1));
-    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb2));
-    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb3));
-    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &n_past));
-    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &n_dims));
-    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(int),      &n_ctx_orig));
-    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(float),    &freq_base));
-    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(float),    &freq_scale));
-    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(float),    &ext_factor));
-    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(float),    &attn_factor));
-    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(float),    &beta_fast));
-    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(float),    &beta_slow));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong), &off0));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &off1));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &off2));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne01));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne03));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb03));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne0));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne3));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int),      &n_past));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(int),      &n_dims));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(int),      &n_ctx_orig));
+    CL_CHECK(clSetKernelArg(kernel, 27, sizeof(float),    &freq_base));
+    CL_CHECK(clSetKernelArg(kernel, 28, sizeof(float),    &freq_scale));
+    CL_CHECK(clSetKernelArg(kernel, 29, sizeof(float),    &ext_factor));
+    CL_CHECK(clSetKernelArg(kernel, 30, sizeof(float),    &attn_factor));
+    CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float),    &beta_fast));
+    CL_CHECK(clSetKernelArg(kernel, 32, sizeof(float),    &beta_slow));
     if (is_mrope || is_vision) {
-        CL_CHECK(clSetKernelArg(kernel, 29, sizeof(int32_t)*4, &sections));
+        CL_CHECK(clSetKernelArg(kernel, 33, sizeof(int32_t)*4, &sections));
+    } else {
+    }
+    if (is_mrope && !is_vision) {
+        const int is_imrope = mode == GGML_ROPE_TYPE_IMROPE ? 1 : 0;
+        CL_CHECK(clSetKernelArg(kernel, 34, sizeof(int), &is_imrope));
+    } else {
     }
 
     size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
@@ -8571,10 +8527,6 @@ static void ggml_cl_rope(ggml_backend_t backend, const ggml_tensor * src0, const
     g_profiling_info.emplace_back();
     populateProfilingInfo(g_profiling_info.back(), extrad->evt, kernel, global_work_size, local_work_size, dst, src1);
 #endif
-    CL_CHECK(clReleaseMemObject(A_d));
-    CL_CHECK(clReleaseMemObject(B_d));
-    if (C_d!=nullptr) CL_CHECK(clReleaseMemObject(C_d));
-    CL_CHECK(clReleaseMemObject(D_d));
 
 }
 
@@ -8668,17 +8620,38 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
     cl_command_queue queue = backend_ctx->queue;
-    const bool is_f16 = q->type == GGML_TYPE_F16;
-    const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
+    const bool is_f32 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32;
+    const bool is_f16 = q->type == GGML_TYPE_F16 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    if (is_f32 || is_f16 || is_mixed) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    if (n_head_kv > 0 && n_head % n_head_kv == 0) {
+    } else {
+        GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_flash_attn");
+        qnn_op_bad = 1;
+        return;
+    }
+    const auto lookup = [](const std::map<std::pair<int, int>, cl_kernel> & table, std::pair<int, int> key) -> cl_kernel {
+        auto it = table.find(key);
+        if (it == table.end()) {
+            return nullptr;
+        } else {
+            return it->second;
+        }
+    };
     cl_kernel kernel = nullptr;
     if (n_q == 1) {
-        if (is_mixed) kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
-        else if (is_f16) kernel = backend_ctx->kernels_flash_attn_f16_q1.at(dk_dv);
-        else kernel = backend_ctx->kernels_flash_attn_f32_q1.at(dk_dv);
+        if (is_mixed) kernel = lookup(backend_ctx->kernels_flash_attn_f32_f16_q1, dk_dv);
+        else if (is_f16) kernel = lookup(backend_ctx->kernels_flash_attn_f16_q1, dk_dv);
+        else kernel = lookup(backend_ctx->kernels_flash_attn_f32_q1, dk_dv);
     } else {
-        if (is_mixed) kernel = backend_ctx->kernels_flash_attn_f32_f16.at(dk_dv);
-        else if (is_f16) kernel = backend_ctx->kernels_flash_attn_f16.at(dk_dv);
-        else kernel = backend_ctx->kernels_flash_attn_f32.at(dk_dv);
+        if (is_mixed) kernel = lookup(backend_ctx->kernels_flash_attn_f32_f16, dk_dv);
+        else if (is_f16) kernel = lookup(backend_ctx->kernels_flash_attn_f16, dk_dv);
+        else kernel = lookup(backend_ctx->kernels_flash_attn_f32, dk_dv);
     }
     if (kernel) {
     } else {
@@ -8687,6 +8660,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         return;
     }
 
+    // Вид делит extra с корнем буфера. offset корня не включает промежуточные view_offs,
+    // а data указывает на первый элемент с учётом всей цепочки видов.
+    const auto byte_off = [](const ggml_tensor * t) -> cl_ulong {
+        return (cl_ulong) ((uintptr_t) t->data - (uintptr_t) cl_ptr_base);
+    };
     ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *) q->extra;
     ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *) k->extra;
     ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *) v->extra;
@@ -8694,17 +8672,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     ggml_tensor_extra_cl * extra_mask = mask ? (ggml_tensor_extra_cl *) mask->extra : nullptr;
     ggml_tensor_extra_cl * extra_sinks = sinks ? (ggml_tensor_extra_cl *) sinks->extra : nullptr;
 
-    cl_ulong offset_q = extra_q->offset + q->view_offs;
-    cl_ulong offset_k = extra_k->offset + k->view_offs;
-    cl_ulong offset_v = extra_v->offset + v->view_offs;
-    cl_ulong offset_o = extra_o->offset + dst->view_offs;
+    cl_ulong offset_q = byte_off(q);
+    cl_ulong offset_k = byte_off(k);
+    cl_ulong offset_v = byte_off(v);
+    cl_ulong offset_o = byte_off(dst);
     cl_mem mask_buffer = extra_mask ? extra_mask->data_device : nullptr;
-    cl_ulong offset_mask = extra_mask ? extra_mask->offset + mask->view_offs : 0;
+    cl_ulong offset_mask = extra_mask ? byte_off(mask) : 0;
     cl_mem sinks_buffer = extra_sinks ? extra_sinks->data_device : nullptr;
-    cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
+    cl_ulong offset_sinks = extra_sinks ? byte_off(sinks) : 0;
     ggml_tensor_extra_cl * extra_rows = kv_rows ? (ggml_tensor_extra_cl *) kv_rows->extra : nullptr;
     cl_mem rows_buffer = extra_rows ? extra_rows->data_device : nullptr;
-    cl_ulong offset_rows = extra_rows ? extra_rows->offset + kv_rows->view_offs : 0;
+    cl_ulong offset_rows = extra_rows ? byte_off(kv_rows) : 0;
     cl_ulong rows_nb1 = kv_rows ? (cl_ulong) kv_rows->nb[1] : 0;
 
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];

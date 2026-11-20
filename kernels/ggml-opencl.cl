@@ -2134,81 +2134,146 @@ kernel void kernel_soft_max(
         global float * src0,
         global float * src1,
         global float * dst,
+        global float * sinks,
         uint ne00,
-//        ((global float*)(dst + rb*nb1 + im*nb2))[r0] = sumf;
-//        uint nb1, uint nb2,
-        uint ne01, uint ne02,
+        uint ne01,
+        uint ne02,
+        uint ne12,
+        uint ne13,
         float scale,
-        float slope
+        float max_bias,
+        float m0,
+        float m1,
+        uint n_head_log2,
+        int has_mask,
+        int has_sinks
 ) {
-  local float _dst[CACHE_SIZE];// размер уточнить при компиляции
     size_t im = get_group_id(2);
-    size_t rb = get_group_id(1);// число голов
+    size_t rb = get_group_id(1);
     size_t r0 = get_group_id(0);
-
-//    size_t offs = im*nb2 + rb*nb1;
-    size_t offs = mad24(im,ne02,rb)*ne01*ne00;
-    global float * psrc0 = (global float *)(src0 + offs) + r0*ne00;
-    global float * pmask = (global float *)(src1       ) + r0*ne00;
-    global float * pdst  = (global float *)(dst  + offs) + r0*ne00;
+    size_t offs = (im*ne02 + rb)*ne01*ne00;
+    global float * psrc0 = src0 + offs + r0*ne00;
+    global float * pdst  = dst  + offs + r0*ne00;
+    float slope = 1.f;
+    if (max_bias > 0.f) {
+        uint h = (uint) rb;
+        if (h < n_head_log2) {
+            slope = pow(m0, (float)(h + 1));
+        } else {
+            slope = pow(m1, (float)(2*(h - n_head_log2) + 1));
+        }
+    } else {
+    }
+    uint i12 = ne12 ? (uint) rb % ne12 : 0;
+    uint i13 = ne13 ? (uint) im % ne13 : 0;
+    global float * pmask = src1 + ((i13*(size_t)ne12 + i12)*(size_t)ne01 + r0)*(size_t)ne00;
     float lmax = -INFINITY;
     for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
-        float v = psrc0[i]*scale + slope*pmask[i];
+        float v = psrc0[i]*scale;
+        if (has_mask) {
+            v += slope*pmask[i];
+        } else {
+        }
         lmax = fmax(lmax, v);
-        _dst[i] = v;
     }
     float max = sub_group_reduce_max(lmax);
-
+    if (has_sinks) {
+        max = fmax(max, sinks[rb]);
+    } else {
+    }
     float lsum = 0.f;
     for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
-        float exp_v = exp(_dst[i] - max);
+        float v = psrc0[i]*scale;
+        if (has_mask) {
+            v += slope*pmask[i];
+        } else {
+        }
+        float exp_v = exp(v - max);
         lsum += exp_v;
-        _dst[i] = exp_v;
+        pdst[i] = exp_v;
     }
-    const float sum = native_recip(sub_group_reduce_add(lsum));
-    for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size())
-        pdst[i] = _dst[i]*sum;
+    float sum = sub_group_reduce_add(lsum);
+    if (has_sinks) {
+        sum += exp(sinks[rb] - max);
+    } else {
+    }
+    const float inv = native_recip(sum);
+    for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
+        pdst[i] *= inv;
+    }
 }
 REQD_SUBGROUP_SIZE_DEFAULT
 kernel void kernel_soft_max_bf16(
         global float * src0,
         global ushort* src1,
         global float * dst,
+        global float * sinks,
         uint ne00,
-//        uint nb1, uint nb2,
-        uint ne01, uint ne02,
+        uint ne01,
+        uint ne02,
+        uint ne12,
+        uint ne13,
         float scale,
-        float slope
+        float max_bias,
+        float m0,
+        float m1,
+        uint n_head_log2,
+        int has_mask,
+        int has_sinks
 ) {
-  local float _dst[CACHE_SIZE];// размер уточнить при компиляции
     size_t im = get_group_id(2);
-    size_t rb = get_group_id(1);// число голов
+    size_t rb = get_group_id(1);
     size_t r0 = get_group_id(0);
-
-//    size_t offs = im*nb2 + rb*nb1;
-    size_t offs = im*ne02*ne01*ne00 + rb*ne01*ne00;
-
-//    size_t offs = i03*ne02*ne01*ne00 + i02*ne01*ne00;
-    global float * psrc0 = (global float *)(src0 + offs) + r0*ne00;
-    global ushort* pmask = (global ushort*)(src1       ) + r0*ne00;
-    global float * pdst  = (global float *)(dst  + offs) + r0*ne00;
+    size_t offs = (im*ne02 + rb)*ne01*ne00;
+    global float * psrc0 = src0 + offs + r0*ne00;
+    global float * pdst  = dst  + offs + r0*ne00;
+    float slope = 1.f;
+    if (max_bias > 0.f) {
+        uint h = (uint) rb;
+        if (h < n_head_log2) {
+            slope = pow(m0, (float)(h + 1));
+        } else {
+            slope = pow(m1, (float)(2*(h - n_head_log2) + 1));
+        }
+    } else {
+    }
+    uint i12 = ne12 ? (uint) rb % ne12 : 0;
+    uint i13 = ne13 ? (uint) im % ne13 : 0;
+    global ushort * pmask = src1 + ((i13*(size_t)ne12 + i12)*(size_t)ne01 + r0)*(size_t)ne00;
     float lmax = -INFINITY;
     for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
-        float v = psrc0[i]*scale + slope*convert_bf16_to_f32(pmask[i]);
+        float v = psrc0[i]*scale;
+        if (has_mask) {
+            v += slope*convert_bf16_to_f32(pmask[i]);
+        } else {
+        }
         lmax = fmax(lmax, v);
-        _dst[i] = v;
     }
     float max = sub_group_reduce_max(lmax);
-
+    if (has_sinks) {
+        max = fmax(max, sinks[rb]);
+    } else {
+    }
     float lsum = 0.f;
     for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
-        float exp_v = exp(_dst[i] - max);
+        float v = psrc0[i]*scale;
+        if (has_mask) {
+            v += slope*convert_bf16_to_f32(pmask[i]);
+        } else {
+        }
+        float exp_v = exp(v - max);
         lsum += exp_v;
-        _dst[i] = exp_v;
+        pdst[i] = exp_v;
     }
-    const float sum = native_recip(sub_group_reduce_add(lsum));
-    for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size())
-        pdst[i] = _dst[i]*sum;
+    float sum = sub_group_reduce_add(lsum);
+    if (has_sinks) {
+        sum += exp(sinks[rb] - max);
+    } else {
+    }
+    const float inv = native_recip(sum);
+    for (uint i = get_sub_group_local_id(); i < ne00; i += get_max_sub_group_size()) {
+        pdst[i] *= inv;
+    }
 }
 
 
@@ -2261,40 +2326,72 @@ kernel void kernel_soft_max_f16(
         global float * src0,
         global half  * src1,
         global float * dst,
+        global float * sinks,
         uint ne00,
-//        uint nb1, uint nb2,
-        uint ne01, uint ne02,
+        uint ne01,
+        uint ne02,
+        uint ne12,
+        uint ne13,
         float scale,
-        float slope
+        float max_bias,
+        float m0,
+        float m1,
+        uint n_head_log2,
+        int has_mask,
+        int has_sinks
 ) {
     size_t im = get_group_id(2);
-    size_t rb = get_group_id(1);// число голов
+    size_t rb = get_group_id(1);
     size_t r0 = get_group_id(0);
-    
-//    size_t offs = im*nb2 + rb*nb1;
-    size_t offs = im*ne02*ne01*ne00 + rb*ne01*ne00;
-
-    global float * psrc0 = (global float *)(src0 + offs) + r0*ne00;
-    global half  * pmask = (global half  *)(src1       ) + r0*ne00;
-    global float * pdst  = (global float *)(dst  + offs) + r0*ne00;
-
+    size_t offs = (im*ne02 + rb)*ne01*ne00;
+    global float * psrc0 = src0 + offs + r0*ne00;
+    global float * pdst  = dst  + offs + r0*ne00;
+    float slope = 1.f;
+    if (max_bias > 0.f) {
+        uint h = (uint) rb;
+        if (h < n_head_log2) {
+            slope = pow(m0, (float)(h + 1));
+        } else {
+            slope = pow(m1, (float)(2*(h - n_head_log2) + 1));
+        }
+    } else {
+    }
+    uint i12 = ne12 ? (uint) rb % ne12 : 0;
+    uint i13 = ne13 ? (uint) im % ne13 : 0;
+    global half * pmask = src1 + ((i13*(size_t)ne12 + i12)*(size_t)ne01 + r0)*(size_t)ne00;
     float lmax = -INFINITY;
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        lmax = fmax(lmax, psrc0[i00]*scale + (pmask ? slope*pmask[i00] : 0.0f));
+        float v = psrc0[i00]*scale;
+        if (has_mask) {
+            v += slope*(float)pmask[i00];
+        } else {
+        }
+        lmax = fmax(lmax, v);
     }
     float max = sub_group_reduce_max(lmax);
-
+    if (has_sinks) {
+        max = fmax(max, sinks[rb]);
+    } else {
+    }
     float lsum = 0.0f;
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        float exp_psrc0 = exp((psrc0[i00]*scale + slope*pmask[i00] - max));
+        float v = psrc0[i00]*scale;
+        if (has_mask) {
+            v += slope*(float)pmask[i00];
+        } else {
+        }
+        float exp_psrc0 = exp(v - max);
         lsum += exp_psrc0;
         pdst[i00] = exp_psrc0;
     }
-
-    const float sum = native_recip(sub_group_reduce_add(lsum));
-
+    float sum = sub_group_reduce_add(lsum);
+    if (has_sinks) {
+        sum += exp(sinks[rb] - max);
+    } else {
+    }
+    const float inv = native_recip(sum);
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
-        pdst[i00] *= sum;
+        pdst[i00] *= inv;
     }
 }
 
@@ -2366,6 +2463,10 @@ kernel void kernel_rope_norm_f32(
         global int   * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2392,6 +2493,10 @@ kernel void kernel_rope_norm_f32(
         float beta_fast,
         float beta_slow
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
 /*    src0 = (global void*)((global char*)src0 + offset0);
     src1 = (global int*)((global char*)src1 + offset1);
     src2 = (global float*)((global char*)src2 + offset2);
@@ -2441,6 +2546,10 @@ kernel void kernel_rope_norm_f16(
         global int * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2467,6 +2576,10 @@ kernel void kernel_rope_norm_f16(
         float beta_fast,
         float beta_slow
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2511,6 +2624,10 @@ kernel void kernel_rope_neox_f32(
         global int * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2537,6 +2654,10 @@ kernel void kernel_rope_neox_f32(
         float beta_fast,
         float beta_slow
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2581,6 +2702,10 @@ kernel void kernel_rope_neox_f16(
         global int * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2607,6 +2732,10 @@ kernel void kernel_rope_neox_f16(
         float beta_fast,
         float beta_slow
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2651,6 +2780,10 @@ kernel void kernel_rope_multi_f32(
         global int * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2676,8 +2809,13 @@ kernel void kernel_rope_multi_f32(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        int4 sections
+        int4 sections,
+        int is_imrope
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2696,19 +2834,26 @@ kernel void kernel_rope_multi_f32(
             int ic = i0/2;
 
             const int sector = (i0 / 2) % sect_dims;
-            float theta_base = 0.0f;
-
-            if (sector < sections.s0) {
-                theta_base = pos[i2];
-            }
-            else if (sector >= sections.s0 && sector < sec_w) {
-                theta_base = pos[i2 + ne2 * 1];
-            }
-            else if (sector >= sec_w && sector < sec_w + sections.s2) {
-                theta_base = pos[i2 + ne2 * 2];
-            }
-            else if (sector >= sec_w + sections.s2) {
-                theta_base = pos[i2 + ne2 * 3];
+            float theta_base = pos[i2 + ne2 * 3];
+            if (is_imrope) {
+                if (sector % 3 == 1 && sector < 3 * sections.s1) {
+                    theta_base = pos[i2 + ne2 * 1];
+                } else if (sector % 3 == 2 && sector < 3 * sections.s2) {
+                    theta_base = pos[i2 + ne2 * 2];
+                } else if (sector % 3 == 0 && sector < 3 * sections.s0) {
+                    theta_base = pos[i2];
+                } else {
+                }
+            } else {
+                if (sector < sections.s0) {
+                    theta_base = pos[i2];
+                } else if (sector >= sections.s0 && sector < sec_w) {
+                    theta_base = pos[i2 + ne2 * 1];
+                } else if (sector >= sec_w && sector < sec_w + sections.s2) {
+                    theta_base = pos[i2 + ne2 * 2];
+                } else if (sector >= sec_w + sections.s2) {
+                } else {
+                }
             }
 
             const float theta = theta_base * pow(freq_base, inv_ndims*i0);
@@ -2740,6 +2885,10 @@ kernel void kernel_rope_multi_f16(
         global int * src1,
         global float * src2,
         global half * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2765,8 +2914,13 @@ kernel void kernel_rope_multi_f16(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        int4 sections
+        int4 sections,
+        int is_imrope
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global half *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2785,19 +2939,26 @@ kernel void kernel_rope_multi_f16(
             int ic = i0/2;
 
             const int sector = (i0 / 2) % sect_dims;
-            float theta_base = 0.0f;
-
-            if (sector < sections.s0) {
-                theta_base = pos[i2];
-            }
-            else if (sector >= sections.s0 && sector < sec_w) {
-                theta_base = pos[i2 + ne2 * 1];
-            }
-            else if (sector >= sec_w && sector < sec_w + sections.s2) {
-                theta_base = pos[i2 + ne2 * 2];
-            }
-            else if (sector >= sec_w + sections.s2) {
-                theta_base = pos[i2 + ne2 * 3];
+            float theta_base = pos[i2 + ne2 * 3];
+            if (is_imrope) {
+                if (sector % 3 == 1 && sector < 3 * sections.s1) {
+                    theta_base = pos[i2 + ne2 * 1];
+                } else if (sector % 3 == 2 && sector < 3 * sections.s2) {
+                    theta_base = pos[i2 + ne2 * 2];
+                } else if (sector % 3 == 0 && sector < 3 * sections.s0) {
+                    theta_base = pos[i2];
+                } else {
+                }
+            } else {
+                if (sector < sections.s0) {
+                    theta_base = pos[i2];
+                } else if (sector >= sections.s0 && sector < sec_w) {
+                    theta_base = pos[i2 + ne2 * 1];
+                } else if (sector >= sec_w && sector < sec_w + sections.s2) {
+                    theta_base = pos[i2 + ne2 * 2];
+                } else if (sector >= sec_w + sections.s2) {
+                } else {
+                }
             }
 
             const float theta = theta_base * pow(freq_base, inv_ndims*i0);
@@ -2829,6 +2990,10 @@ kernel void kernel_rope_vision_f32(
         global int * src1,
         global float * src2,
         global float * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2856,6 +3021,10 @@ kernel void kernel_rope_vision_f32(
         float beta_slow,
         int4 sections
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global float *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);
@@ -2903,6 +3072,10 @@ kernel void kernel_rope_vision_f16(
         global int * src1,
         global float * src2,
         global half * dst,
+        ulong off0,
+        ulong off1,
+        ulong off2,
+        ulong offd,
         int ne00,
         int ne01,
         int ne02,
@@ -2930,6 +3103,10 @@ kernel void kernel_rope_vision_f16(
         float beta_slow,
         int4 sections
 ) {
+    src0 = (global void *)((global char *)src0 + off0);
+    src1 = (global int *)((global char *)src1 + off1);
+    src2 = (global float *)((global char *)src2 + off2);
+    dst = (global half *)((global char *)dst + offd);
     int i3 = get_group_id(2);
     int i2 = get_group_id(1);
     int i1 = get_group_id(0);

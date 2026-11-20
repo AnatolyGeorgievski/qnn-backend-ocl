@@ -138,9 +138,7 @@ __kernel void flash_attn_f32_f16(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (my_query_row >= n_q) {
-            continue;
-        }
+        if (my_query_row < n_q) {
 
         for (int j = 0; j < BLOCK_N; j += 2) {
             const int k_row0 = k_start + j;
@@ -164,15 +162,19 @@ __kernel void flash_attn_f32_f16(
             if (k_row0 >= n_kv) score0 = -INFINITY;
             if (k_row1 >= n_kv) score1 = -INFINITY;
 
+            if (logit_softcap > 0.0f) {
+                score0 = logit_softcap * tanh(score0 / logit_softcap);
+                score1 = logit_softcap * tanh(score1 / logit_softcap);
+            }
             if (mask_base != NULL) {
                 const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
                 if (k_row0 < n_kv) score0 += slope * (ACC_TYPE)mask_ptr[k_row0];
                 if (k_row1 < n_kv) score1 += slope * (ACC_TYPE)mask_ptr[k_row1];
             }
-
-            if (logit_softcap > 0.0f) {
-                score0 = logit_softcap * tanh(score0 / logit_softcap);
-                score1 = logit_softcap * tanh(score1 / logit_softcap);
+            if (!isfinite(score0)) score0 = -INFINITY;
+            if (!isfinite(score1)) score1 = -INFINITY;
+            if (score0 == -INFINITY && score1 == -INFINITY && m_i == -INFINITY) {
+                continue;
             }
 
             const ACC_TYPE m_new = max(m_i, max(score0, score1));
@@ -187,6 +189,8 @@ __kernel void flash_attn_f32_f16(
             l_i = l_i * scale_prev + p0 + p1;
             m_i = m_new;
         }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     if (my_query_row < n_q) {
@@ -301,12 +305,15 @@ __kernel void flash_attn_f32_f16_q1(
             dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
         }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
+        if (!isfinite(score)) {
+            continue;
         }
         m_i = max(m_i, score);
     }
@@ -338,12 +345,15 @@ __kernel void flash_attn_f32_f16_q1(
             dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (logit_softcap > 0.0f) {
+            score = logit_softcap * tanh(score / logit_softcap);
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
         }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
+        if (!isfinite(score)) {
+            continue;
         }
         const ACC_TYPE p = exp(score - m_final);
         l_i += p;
