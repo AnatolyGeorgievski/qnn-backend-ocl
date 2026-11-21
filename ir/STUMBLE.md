@@ -45,3 +45,15 @@ arc3 `192.168.1.187:18767`, `ggml-rpc-server -d CUDA0,CUDA1`, v10.0.1.
 | gemma-4-E4B Q4_0 | OK · «Hello! How can I help you today?» · ~90 / 61 t/s |
 
 Пара OCL `:18769` (B60) и CUDA `:18767` — один протокол 10.0.1.
+
+## Dual-path · 2026-11-21 19:18 UTC
+
+Один клиент arc3 `llama-cli` 10.0.1, одна фраза `Hello`, `-n 48 --temp 0 -st -ngl 99`,
+модель `/tmp/gemma-4-E4B-it-Q4_0.gguf`.
+
+| путь | RPC | речь | prompt / gen |
+|--|--|--|--|
+| CUDA | `192.168.1.187:18767` | Hello! How can I help you today? | 180.6 / 65.7 t/s · wall 5.3s |
+| OCL B60 | `192.168.1.185:18769` | Hello! How can I help you today? | 39.0 / 20.4 t/s · wall 29.4s |
+
+Текст ответа совпал. На arc3 параллельно живёт llama-server (~20 GiB/GPU) — CUDA RPC всё равно вместился.
