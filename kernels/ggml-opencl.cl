@@ -1153,54 +1153,104 @@ kernel void kernel_mean(
     *(global float *)(dst + off_d + (ulong) i1 * nb1 + (ulong) i2 * nb2 + (ulong) i3 * nb3) = sum * (1.f / (float) ne00);
 }
 
+// SSM_CONV. Скользящее окно d_conv по каналу: src0 {ncs,d_inner,n_s}, src1 {d_conv,d_inner} → dst {d_inner,n_t,n_s}.
+// Как CPU/Vulkan: на (канал, токен, seq) — скалярное произведение окна.
+kernel void kernel_ssm_conv(
+        global char * src0,
+        ulong off0,
+        global char * src1,
+        ulong off1,
+        global char * dst,
+        ulong offd,
+        int nc,
+        int nr,
+        int n_t,
+        int n_s,
+        ulong nb01, ulong nb02,
+        ulong nb11,
+        ulong nb0, ulong nb1, ulong nb2
+) {
+    int i1 = get_global_id(0);
+    int i2 = get_global_id(1);
+    int i3 = get_global_id(2);
+    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+        return;
+    }
+    global const float * s = (global const float *)(src0 + off0 + (ulong) i1 * nb01 + (ulong) i3 * nb02) + i2;
+    global const float * c = (global const float *)(src1 + off1 + (ulong) i1 * nb11);
+    float sum = 0.f;
+    for (int i0 = 0; i0 < nc; ++i0) {
+        sum += s[i0] * c[i0];
+    }
+    *(global float *)(dst + offd + (ulong) i1 * nb0 + (ulong) i2 * nb1 + (ulong) i3 * nb2) = sum;
+}
+
 //------------------------------------------------------------------------------
-// gelu
+// unary
 //------------------------------------------------------------------------------
 #define GELU_QUICK_COEF -1.702f
 #define GELU_COEF_A     0.044715f
 #define SQRT_2_OVER_PI  0.79788456080286535587989211986876f
 #define SQRT_1_OVER_2   0.70710678118654752440084436210485f
 
-//------------------------------------------------------------------------------
-// silu, gelu, elu, sigmoid
-//------------------------------------------------------------------------------
+// --- float helpers -----------------------------------------------------------
 inline float  OVERLOADABLE silu(float  x){  return x / (1.f + exp(-x)); }
 inline float8 OVERLOADABLE silu(float8 x){  return x / (1.f + exp(-x)); }
-inline float  OVERLOADABLE gelu_quick(float x) { return x * (1.f / (1.f + exp(GELU_QUICK_COEF * x))); }
 inline float  OVERLOADABLE gelu(float  x){  return 0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x))); }
 inline float8 OVERLOADABLE gelu(float8 x){  return 0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x))); }
 inline float  OVERLOADABLE gelu_erf(float  x) { return 0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)); }
 inline float8 OVERLOADABLE gelu_erf(float8 x) { return 0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)); }
+inline float  OVERLOADABLE gelu_quick(float x) { return x * (1.f / (1.f + exp(GELU_QUICK_COEF * x))); }
 inline float  OVERLOADABLE relu(float  x){  return fmax(0.f, x); }
 inline float8 OVERLOADABLE relu(float8 x){  return fmax(0.f, x); }
-inline float  OVERLOADABLE  elu(float  x){  return (x > 0.f) ? x : expm1(x); }
+inline float  OVERLOADABLE elu(float  x){  return (x > 0.f) ? x : expm1(x); }
+inline float sigmoid   (float x) { return native_recip((1.f + exp(-x))); }
+inline float swish     (float x) { return x * native_recip((1.f + exp(-x))); }
+inline float hardsigmoid(float x){ return fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f)); }
+inline float hardswish (float x) { return x * fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f)); }
+// порог 20 как CUDA/CPU: (x > 20) ? x : log1p(exp(x))
+inline float softplus  (float x) { return (x > 20.f) ? x : log(1.f + exp(x)); }
 
-inline half  relu_f16(half  x){  return fmax(0.h, x); }
-inline half  gelu_f16(half  xh){  
+inline float op_sgn  (float x) { return sign(x); }
+inline float op_neg  (float x) { return -x; }
+inline float op_step (float x) { return x > 0.f; }
+inline float op_sqr  (float x) { return x*x; }
+inline float op_clamp(float x, const float min, const float max){ return x < min ? min : (x > max ? max : x); }
+inline float op_leaky_relu(float x, const float negative_slope) { return fmax(x, 0) + fmin(x, 0.0f) * negative_slope; }
+
+// --- half helpers ------------------------------------------------------------
+inline half silu_f16(half x){ return x / (1.h + half_exp(-x)); }
+inline half gelu_f16(half xh){
     float x = xh;
-    return convert_half_rte(0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x)))); }
+    return convert_half_rte(0.5f*x*(1.f + tanh(SQRT_2_OVER_PI*x*(1.f + GELU_COEF_A*x*x))));
+}
 inline half gelu_erf_f16(half xh) {
     float x = xh;
     return convert_half_rte(0.5f * x * (1.0f + erf(x * SQRT_1_OVER_2)));
 }
-inline half  gelu_quick_f16(half xh) { 
+inline half gelu_quick_f16(half xh) {
     float x = xh;
-    return convert_half_rte(x * (1.f / (1.f + exp(GELU_QUICK_COEF * x)))); }
-inline half   elu_f16(half  x){  return (x > 0.h) ? x : half_exp(x)-1.h; }
-inline half  silu_f16(half  x){  return x / (1.h + half_exp(-x)); }
-inline half   sgn_f16(half  x){  return sign(x); }
-inline half   exp_f16(half  x){  return half_exp(x); }
-inline half  tanh_f16(half  x){  return tanh(x); }
-inline half   neg_f16(half  x){  return -x; }
-inline half   sqr_f16(half  x){  return x*x; }
-inline half  sqrt_f16(half  x){  return half_sqrt(x); }
-inline half  fabs_f16(half  x){  return fabs(x); }
-inline half  sigmoid_f16(half x) { return native_recip((1.h + half_exp(-x))); }
-inline half step_f16(half  x)   { return  x > 0.h; }
-inline half expm1_f16(half xh) {
-    float x = xh;
-    return convert_half_rte(exp(x) - 1.f);
+    return convert_half_rte(x * (1.f / (1.f + exp(GELU_QUICK_COEF * x))));
 }
+inline half relu_f16(half x){ return fmax(0.h, x); }
+inline half elu_f16(half x){ return (x > 0.h) ? x : half_exp(x)-1.h; }
+inline half sigmoid_f16(half x) { return native_recip((1.h + half_exp(-x))); }
+inline half hardsigmoid_f16(half x){ return fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
+inline half hardswish_f16(half x) { return x * fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
+inline half softplus_f16(half xh) {
+    float x = xh;
+    return convert_half_rte((x > 20.f) ? x : log(1.f + exp(x)));
+}
+
+inline half sgn_f16(half x){ return sign(x); }
+inline half neg_f16(half x){ return -x; }
+inline half step_f16(half x){ return x > 0.h; }
+inline half sqr_f16(half x){ return x*x; }
+inline half fabs_f16(half x){ return fabs(x); }
+inline half sqrt_f16(half x){ return half_sqrt(x); }
+inline half exp_f16(half x){ return half_exp(x); }
+inline half tanh_f16(half x){ return tanh(x); }
+inline half expm1_f16(half xh) { float x = xh; return convert_half_rte(exp(x) - 1.f); }
 inline half floor_f16(half xh) { float x = xh; return convert_half_rte(floor(x)); }
 inline half ceil_f16(half xh)  { float x = xh; return convert_half_rte(ceil(x)); }
 inline half round_f16(half xh) { float x = xh; return convert_half_rte(round(x)); }
@@ -1208,21 +1258,8 @@ inline half trunc_f16(half xh) { float x = xh; return convert_half_rte(trunc(x))
 inline half log_f16(half xh) { float x = xh; return convert_half_rte(log(x)); }
 inline half sin_f16(half xh) { float x = xh; return convert_half_rte(sin(x)); }
 inline half cos_f16(half xh) { float x = xh; return convert_half_rte(cos(x)); }
-inline half hardsigmoid_f16(half x){ return fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
-inline half hardswish_f16 (half x) { return x * fmin(1.h, fmax(0.h, (x + 3.h) / 6.h)); }
 
-inline float sigmoid   (float x) { return native_recip((1.f + exp(-x))); }
-inline float hardsigmoid(float x){ return fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f)); }
-inline float swish   (float x)   { return x * native_recip((1.f + exp(-x))); }
-inline float hardswish (float x) { return x * fmin(1.0f, fmax(0.0f, (x + 3.0f) / 6.0f)); }
-inline float op_sgn   (float x)  { return sign(x)/* (x > 0.f ? 1.f : ((x < 0.f ? -1.f : 0.f))) */; }
-inline float op_neg  (float x)   { return -x; }
-inline float op_step (float x)   { return  x > 0.f; }
-inline float op_clamp(float x, const float min, const float max){ return  x < min ? min : (x > max ? max : x); }
-inline float op_leaky_relu(float x, const float negative_slope) { return fmax(x, 0) + fmin(x, 0.0f) * negative_slope; }
-inline float op_sqr(float  x){  return x*x; }
-
-// синтез унарных операций по шаблону для заданного типа данных
+// --- macros ------------------------------------------------------------------
 #define KERNEL_UNARY(op, type)      \
 kernel void kernel_##op(            \
         global type * src0,         \
@@ -1255,118 +1292,127 @@ kernel void kernel_##op##_strided(              \
     *y = op(*x);                                \
     (void) ne3;                                 \
 }
-KERNEL_UNARY(silu_f16, half);
-KERNEL_UNARY(gelu_f16, half);
-KERNEL_UNARY(gelu_erf_f16, half);
-KERNEL_UNARY(gelu_quick_f16, half);
-KERNEL_UNARY(relu_f16, half);
-KERNEL_UNARY(fabs_f16, half);
-KERNEL_UNARY(tanh_f16, half);
-KERNEL_UNARY(exp_f16,  half);
-KERNEL_UNARY(elu_f16,  half);
-KERNEL_UNARY(sigmoid_f16,   half);
-KERNEL_UNARY(hardsigmoid_f16,   half);
-KERNEL_UNARY(hardswish_f16,   half);
-KERNEL_UNARY(sgn_f16,    half);// sign
-KERNEL_UNARY(neg_f16,    half);
-KERNEL_UNARY(sqr_f16,    half);
-KERNEL_UNARY(sqrt_f16,   half);
-KERNEL_UNARY(step_f16,   half);
 
-
+// --- float kernels -----------------------------------------------------------
+// активации
 KERNEL_UNARY(silu, float);
 KERNEL_UNARY(gelu, float);
 KERNEL_UNARY(gelu_erf, float);
+KERNEL_UNARY(gelu_quick, float);
 KERNEL_UNARY(relu, float);
-KERNEL_UNARY(elu,  float);
-KERNEL_UNARY(hardswish, float);
+KERNEL_UNARY(elu, float);
+KERNEL_UNARY(sigmoid, float);
+KERNEL_UNARY(swish, float);
 KERNEL_UNARY(hardsigmoid, float);
-KERNEL_UNARY(gelu_quick,float);
-KERNEL_UNARY(swish,     float);
-KERNEL_UNARY(sigmoid,   float);
-KERNEL_UNARY(op_sgn,    float);// sign
-KERNEL_UNARY(op_neg,    float);
-KERNEL_UNARY(op_step,   float);
-KERNEL_UNARY(op_sqr,    float);
-
-
+KERNEL_UNARY(hardswish, float);
+KERNEL_UNARY(softplus, float);
+KERNEL_UNARY(op_sgn, float);
+KERNEL_UNARY(op_neg, float);
+KERNEL_UNARY(op_step, float);
+KERNEL_UNARY(op_sqr, float);
+// math (имена builtins)
 KERNEL_UNARY(fabs, float);
 KERNEL_UNARY(sign, float);
-KERNEL_UNARY(erf,  float);
+KERNEL_UNARY(erf, float);
 KERNEL_UNARY(erfc, float);
-KERNEL_UNARY(exp,  float);
+KERNEL_UNARY(exp, float);
 KERNEL_UNARY(exp2, float);
-KERNEL_UNARY(exp10,float);
-KERNEL_UNARY(expm1,float);
-KERNEL_UNARY_STRIDED(expm1, float);
-KERNEL_UNARY(log,  float);
+KERNEL_UNARY(exp10, float);
+KERNEL_UNARY(expm1, float);
+KERNEL_UNARY(log, float);
 KERNEL_UNARY(log2, float);
-KERNEL_UNARY(log10,float);
+KERNEL_UNARY(log10, float);
 KERNEL_UNARY(sqrt, float);
-KERNEL_UNARY(rsqrt,float);
-KERNEL_UNARY(sin,  float);
-KERNEL_UNARY(cos,  float);
-KERNEL_UNARY(tan,  float);
+KERNEL_UNARY(rsqrt, float);
+KERNEL_UNARY(sin, float);
+KERNEL_UNARY(cos, float);
+KERNEL_UNARY(tan, float);
 KERNEL_UNARY(asin, float);
 KERNEL_UNARY(acos, float);
 KERNEL_UNARY(atan, float);
 KERNEL_UNARY(sinh, float);
 KERNEL_UNARY(cosh, float);
 KERNEL_UNARY(tanh, float);
+KERNEL_UNARY(floor, float);
+KERNEL_UNARY(ceil, float);
+KERNEL_UNARY(trunc, float);
+KERNEL_UNARY(round, float);
+KERNEL_UNARY(rint, float);
+// float · strided
 KERNEL_UNARY_STRIDED(silu, float);
 KERNEL_UNARY_STRIDED(gelu, float);
 KERNEL_UNARY_STRIDED(gelu_erf, float);
+KERNEL_UNARY_STRIDED(gelu_quick, float);
 KERNEL_UNARY_STRIDED(relu, float);
 KERNEL_UNARY_STRIDED(elu, float);
-KERNEL_UNARY_STRIDED(hardswish, float);
-KERNEL_UNARY_STRIDED(hardsigmoid, float);
-KERNEL_UNARY_STRIDED(gelu_quick, float);
 KERNEL_UNARY_STRIDED(sigmoid, float);
+KERNEL_UNARY_STRIDED(hardsigmoid, float);
+KERNEL_UNARY_STRIDED(hardswish, float);
+KERNEL_UNARY_STRIDED(softplus, float);
 KERNEL_UNARY_STRIDED(op_sgn, float);
 KERNEL_UNARY_STRIDED(op_neg, float);
 KERNEL_UNARY_STRIDED(op_step, float);
 KERNEL_UNARY_STRIDED(fabs, float);
 KERNEL_UNARY_STRIDED(exp, float);
+KERNEL_UNARY_STRIDED(expm1, float);
 KERNEL_UNARY_STRIDED(tanh, float);
+KERNEL_UNARY_STRIDED(floor, float);
+KERNEL_UNARY_STRIDED(ceil, float);
+KERNEL_UNARY_STRIDED(round, float);
+KERNEL_UNARY_STRIDED(trunc, float);
+
+// --- half kernels ------------------------------------------------------------
+KERNEL_UNARY(silu_f16, half);
+KERNEL_UNARY(gelu_f16, half);
+KERNEL_UNARY(gelu_erf_f16, half);
+KERNEL_UNARY(gelu_quick_f16, half);
+KERNEL_UNARY(relu_f16, half);
+KERNEL_UNARY(elu_f16, half);
+KERNEL_UNARY(sigmoid_f16, half);
+KERNEL_UNARY(hardsigmoid_f16, half);
+KERNEL_UNARY(hardswish_f16, half);
+KERNEL_UNARY(softplus_f16, half);
+KERNEL_UNARY(sgn_f16, half);
+KERNEL_UNARY(neg_f16, half);
+KERNEL_UNARY(step_f16, half);
+KERNEL_UNARY(sqr_f16, half);
+KERNEL_UNARY(fabs_f16, half);
+KERNEL_UNARY(sqrt_f16, half);
+KERNEL_UNARY(exp_f16, half);
+KERNEL_UNARY(expm1_f16, half);
+KERNEL_UNARY(tanh_f16, half);
+KERNEL_UNARY(floor_f16, half);
+KERNEL_UNARY(ceil_f16, half);
+KERNEL_UNARY(round_f16, half);
+KERNEL_UNARY(trunc_f16, half);
+KERNEL_UNARY(log_f16, half);
+KERNEL_UNARY(sin_f16, half);
+KERNEL_UNARY(cos_f16, half);
+// half · strided
 KERNEL_UNARY_STRIDED(silu_f16, half);
 KERNEL_UNARY_STRIDED(gelu_f16, half);
 KERNEL_UNARY_STRIDED(gelu_erf_f16, half);
 KERNEL_UNARY_STRIDED(gelu_quick_f16, half);
 KERNEL_UNARY_STRIDED(relu_f16, half);
-KERNEL_UNARY_STRIDED(fabs_f16, half);
-KERNEL_UNARY_STRIDED(tanh_f16, half);
-KERNEL_UNARY_STRIDED(exp_f16, half);
 KERNEL_UNARY_STRIDED(elu_f16, half);
 KERNEL_UNARY_STRIDED(sigmoid_f16, half);
 KERNEL_UNARY_STRIDED(hardsigmoid_f16, half);
 KERNEL_UNARY_STRIDED(hardswish_f16, half);
+KERNEL_UNARY_STRIDED(softplus_f16, half);
 KERNEL_UNARY_STRIDED(sgn_f16, half);
 KERNEL_UNARY_STRIDED(neg_f16, half);
 KERNEL_UNARY_STRIDED(step_f16, half);
-KERNEL_UNARY(expm1_f16, half);
+KERNEL_UNARY_STRIDED(fabs_f16, half);
+KERNEL_UNARY_STRIDED(exp_f16, half);
 KERNEL_UNARY_STRIDED(expm1_f16, half);
-KERNEL_UNARY_STRIDED(floor, float);
-KERNEL_UNARY_STRIDED(ceil, float);
-KERNEL_UNARY_STRIDED(round, float);
-KERNEL_UNARY_STRIDED(trunc, float);
-KERNEL_UNARY(floor_f16, half);
+KERNEL_UNARY_STRIDED(tanh_f16, half);
 KERNEL_UNARY_STRIDED(floor_f16, half);
-KERNEL_UNARY(ceil_f16, half);
 KERNEL_UNARY_STRIDED(ceil_f16, half);
-KERNEL_UNARY(round_f16, half);
 KERNEL_UNARY_STRIDED(round_f16, half);
-KERNEL_UNARY(trunc_f16, half);
 KERNEL_UNARY_STRIDED(trunc_f16, half);
-KERNEL_UNARY(log_f16, half);
-KERNEL_UNARY(sin_f16, half);
-KERNEL_UNARY(cos_f16, half);
-KERNEL_UNARY(ceil, float);
-KERNEL_UNARY(floor,float);
-KERNEL_UNARY(trunc,float);
-KERNEL_UNARY(round,float);
-KERNEL_UNARY(rint, float);
 
 #undef KERNEL_UNARY
+#undef KERNEL_UNARY_STRIDED
 inline float8 OVERLOADABLE add(float8 u, float8 v){  return u+v; }
 inline float8 OVERLOADABLE sub(float8 u, float8 v){  return u-v; }
 inline float8 OVERLOADABLE mul(float8 u, float8 v){  return u*v; }
