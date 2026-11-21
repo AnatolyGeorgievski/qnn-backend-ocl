@@ -20,14 +20,14 @@ static void check(const char *line, uint8_t want_op, int want_srcs)
 
 int main(void)
 {
-	check("MUL_MAT   r5.bf16(384x128x4)   r1.f32(384x365x28)", MCP_IR_MUL_MAT, 0);
-	check("SILU      $2", MCP_IR_SILU, 1);
-	check("ADD       $1  $3", MCP_IR_ADD, 2);
-	check("BARRIER", MCP_IR_BARRIER, 0);
+	check("MUL_MAT   r5.bf16(384x128x4)   r1.f32(384x365x28)", GGML_OP_MUL_MAT, 0);
+	check("SILU      $2", GGML_OP_UNARY, 1);
+	check("ADD       $1  $3", GGML_OP_ADD, 2);
+	check("BARRIER", GGML_OP_BARRIER, 0);
 	{
 		struct mcp_ir_node n;
 		if (mcp_ir_node_from_line("MUL_MAT   r5.bf16(384x128x4)  $1", &n) ||
-		    n.op != MCP_IR_MUL_MAT || n.dtype != MCP_IR_BF16 || n.n_src != 1) {
+		    n.op != GGML_OP_MUL_MAT || n.dtype != GGML_TYPE_BF16 || n.n_src != 1) {
 			printf("FAIL  dtype from line op=%u dt=%u ns=%u\n", n.op, n.dtype, n.n_src);
 			fail++;
 		} else printf("OK    dtype from line\n");
@@ -43,29 +43,30 @@ int main(void)
 	/* Zero-Copy слот + host ADD */
 	{
 		struct mcp_ir_slot a, b, d;
-		uint32_t sh[3] = { 4, 1, 1 };
+		size_t ne[GGML_MAX_DIMS];
 		float *fa, *fb, *fd;
-		if (mcp_ir_slot_alloc(&a, 16 * sizeof(float), MCP_IR_F32, sh) ||
-		    mcp_ir_slot_alloc(&b, 16 * sizeof(float), MCP_IR_F32, sh) ||
-		    mcp_ir_slot_alloc(&d, 16 * sizeof(float), MCP_IR_F32, sh)) {
+		mcp_ir_ne_set(ne, 4, 1, 1, 1);
+		if (mcp_ir_slot_alloc(&a, 16 * sizeof(float), GGML_TYPE_F32, ne) ||
+		    mcp_ir_slot_alloc(&b, 16 * sizeof(float), GGML_TYPE_F32, ne) ||
+		    mcp_ir_slot_alloc(&d, 16 * sizeof(float), GGML_TYPE_F32, ne)) {
 			printf("FAIL  slot_alloc\n"); fail++;
 		} else {
 			fa = a.base; fb = b.base; fd = d.base;
 			fa[0] = 2.f; fb[0] = 3.f;
-			if (mcp_ir_host_binop(MCP_IR_ADD, &d, &a, &b) || fd[0] != 5.f) {
+			if (mcp_ir_host_binop(GGML_OP_ADD, &d, &a, &b) || fd[0] != 5.f) {
 				printf("FAIL  host ADD got %g\n", (double)fd[0]); fail++;
 			} else
 				printf("OK    slot mmap + host ADD\n");
 			fa[0]=2.f; fb[0]=4.f;
-			if (mcp_ir_host_binop(MCP_IR_MUL, &d, &a, &b) || fd[0] != 8.f) {
+			if (mcp_ir_host_binop(GGML_OP_MUL, &d, &a, &b) || fd[0] != 8.f) {
 				printf("FAIL  host MUL\n"); fail++;
 			} else printf("OK    host MUL\n");
 			fa[0]=0.f;
-			if (mcp_ir_host_unary(MCP_IR_SILU, &d, &a) || fabsf(fd[0]-0.f)>1e-6f) {
+			if (mcp_ir_host_unary(GGML_OP_UNARY, &d, &a) || fabsf(fd[0]-0.f)>1e-6f) {
 				printf("FAIL  host SILU\n"); fail++;
 			} else printf("OK    host SILU\n");
 			fa[0]=3.f; fa[1]=4.f;
-			if (mcp_ir_host_unary(MCP_IR_RMS_NORM, &d, &a)) {
+			if (mcp_ir_host_unary(GGML_OP_RMS_NORM, &d, &a)) {
 				printf("FAIL  host RMS\n"); fail++;
 			} else printf("OK    host RMS\n");
 			mcp_ir_slot_free(&a); mcp_ir_slot_free(&b); mcp_ir_slot_free(&d);
@@ -74,8 +75,9 @@ int main(void)
 	/* фраза: 3 * 2 + 1, затем silu */
 	{
 		struct mcp_ir_slot ring[6];
-		uint32_t sh[3] = { 1, 1, 1 };
+		size_t ne[GGML_MAX_DIMS];
 		uint16_t head = 3;
+		mcp_ir_ne_set(ne, 1, 1, 1, 1);
 		const char *phrase[] = {
 			"MUL $1 $2",
 			"ADD $1 $4",
@@ -85,7 +87,7 @@ int main(void)
 		float want;
 		int k;
 		for (k = 0; k < 6; k++) {
-			if (mcp_ir_slot_alloc(&ring[k], sizeof(float), MCP_IR_F32, sh)) {
+			if (mcp_ir_slot_alloc(&ring[k], sizeof(float), GGML_TYPE_F32, ne)) {
 				printf("FAIL  phrase alloc\n");
 				fail++;
 				break;

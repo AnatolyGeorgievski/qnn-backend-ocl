@@ -2,3 +2,9 @@ build/
 *.o
 *.a
 .cache/
+# IR build products
+ir/mcp_ir_say
+ir/mcp_ir_say_ocl
+ir/mcp_ir_say_stdin
+ir/mcp_ir_smoke
+ir/*.o
