@@ -1,55 +1,31 @@
-# tools/quantize · BF16/F16 → свой f8
+# tools/quantize · указатель
 
 <tags>
-- include/qnn.h
+- /home/george/QuantumNN/tools/quantize/README.md
+- /home/george/QuantumNN/tools/quantize/REPRO-fp8.md
+- /home/george/QuantumNN/qnn.h
 - /home/george/qnn-backend-ocl/README.md
-- QuantumNN/QUANT.md
-- QuantumNN/FPQUANT.md
-- tools/quantize/REPRO-fp8.md
 </tags>
 
 <topo>
 name: [[cursor]]
 links:
+  - [[QuantumNN]]
   - [[qnn-backend-ocl]]
 path: /home/george/qnn-backend-ocl/tools/quantize/README.md
 </topo>
 
-## Назначение
+Канон **не здесь**. Типы, `qnn-encode`, рецепт FP8:
 
-Утилита конвертации весов (BF16/F16) в формат QNN (f8_e4m3 / bf8 + опция remainder/SR). Часть **QNN Backend-OCL**, не зерно знаний QuantumNN.
-
-Выход + отчёт ошибки. Клиент:
+- `/home/george/QuantumNN/qnn.h`
+- `/home/george/QuantumNN/tools/quantize/` (`qnn-encode.c`, [REPRO-fp8.md](../../../QuantumNN/tools/quantize/REPRO-fp8.md))
+- разбор: `/home/george/QuantumNN/qnn_safetensors.c`
 
 ```bash
-tools/quantize/qnn-encode hf8 weights.f32 weights.hf8
-tools/quantize/qnn-encode bf8 weights.f32 weights.bf8
-tools/quantize/qnn-encode hf8-block N K [B] weights.f32 weights.hf8 weights.scale.bf16
-tools/quantize/qnn-encode hf8-block N K [B] weights.f32 out.safetensors [tensor_name]
+cd /home/george/QuantumNN/tools/quantize
+gcc -O2 -o qnn-encode qnn-encode.c -lm
 ```
 
-Без файлов печатает ошибку на коротком наборе f32. `hf8` — E4M3, `bf8` — E5M2. Числа те же, что в `include/qnn.h`.
-
-`hf8-block` — раскладка как у Qwen FP8: блоки `B×B` (по умолчанию 128), `scale_inv = amax/448` в BF16, вес в HF8. Dequant: `fp8 * scale_inv`. Выход `.safetensors` пишет пару `name` + `name_scale_inv` (имя по умолчанию `weight`). Проверка 2026-11-21 на `gate_proj[256×256]` Qwen3.8: RMSE блочного ≈ ихнему FP8; `qnn-st -n` читает наш `.safetensors`.
-
-Повторяемый рецепт (HF range → encode → qnn-st): [REPRO-fp8.md](REPRO-fp8.md).
-
-## План
-
-Финальная система берёт неквантованный формат и жмёт его оптимально под конкретную архитектуру. На архитектуру приходится один оптимальный формат.
-
-Утилита берёт один тензор или все тензоры файла. В отчёте у каждой строки написан тип кванта.
-
-Файл публикуется в BF16. В этом типе уже могут лежать квантованные значения. Сначала утилита смотрит, покрывает ли тензор весь диапазон BF16. Если значения умещаются в более узкий тип, они уходят в f16, HF8 и дальше без потери точности. От этой проверки зависит, какой квант выбирать.
-
-Кроме диапазона утилита различает финитную арифметику и нормализацию чисел. Базовая классификация — все ли числа денормализованы.
-
-Дальше центральный инструмент — векторное преобразование типов. Оно идёт на AVX-512 или AVX10.+: там есть штатные команды преобразования векторов. Такие вектора держат две машины. Отладка преобразования — на них.
-
-Ход кванта. Вес, который остаётся широким, поднимается из BF16 в вектор f32. Из этого вектора пишется квант.
-
-Тип на этом шаге — `Q4_K` или `Q6_K`. Свои кванты называем, когда до них дойдём. `hf8` и `bf8` остаются для готового вектора f32.
-
-Отладка. Берёшь исходный BF16. Прогоняешь штатный `llama-quantize` в выбранный тип. Прогоняешь наш `qnn-encode` в тот же тип. Рядом две ошибки. Наш квант лучше, когда его ошибка меньше.
+Копию `include/qnn.h` в этом каталоге не вести.
 
 **подпись:** Курсор

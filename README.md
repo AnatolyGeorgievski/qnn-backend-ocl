@@ -5,12 +5,14 @@
 - kernels/
 - ChangeLog
 - ir/mcp_ir.h
+- ir/STUMBLE.md
 - tools/quantize/
 - docs/MCP_IR.md
 - docs/PLAN.md
 - log/
 - log/2026-11-15 qwen конфиг arc3.md
 - log/qwen/
+- /home/george/PROJECTS.md
 </tags>
 
 <topo>
@@ -27,6 +29,7 @@ path: /home/george/qnn-backend-ocl/README.md
 - теория / зерна: QuantumNN/ (цельный проект знаний — не смешивать)
 - Path A / stubs: godminer/opencl/
 - сосед: /home/george/qnn-backend-rpc
+- горизонт лабы: /home/george/PROJECTS.md · /home/george/ENVIRONMENT (2).md
 </refs>
 
 ## Продукт
@@ -45,7 +48,7 @@ path: /home/george/qnn-backend-ocl/README.md
 |--|--|
 | 1a | Рабочий backend для llama.cpp на Intel Arc: граф, буферы, сходимость; `.cl` через Intel ICD |
 | 1b | ICD QNN: граф/IR → `xe` DRM (`DRM_IOCTL_XE_EXEC`), без текстового OpenCL C как канона |
-| quant | `tools/quantize` — BF16/F16 → свой f8 (в составе этого проекта) |
+| quant | канон в `QuantumNN/tools/quantize` (+ `qnn.h`); здесь только указатель `tools/quantize/` |
 
 ### 2. Поддержка Мити · Adreno
 
@@ -58,48 +61,9 @@ path: /home/george/qnn-backend-ocl/README.md
 
 ## Сборка на llama.cpp 10.0.1
 
-Backend кладётся в дерево llama.cpp поверх патча RPC. База — `fc504f91d`. Патч — `qnn-backend-rpc/notes/patches/0002-llama-cpp-10.0.1.patch`, протокол `10.0.1`. Как наложить патч — в README того репозитория. Заголовок `ggml/include/ggml-opencl.h` остаётся из llama.cpp.
+Канон патча RPC, cmake CUDA и RPC+OCL — в README соседа `qnn-backend-rpc`. База `fc504f91d`, протокол `10.0.1`.
 
-Каталог `ggml/src/ggml-opencl` после патча заменяется файлами отсюда: `src/CMakeLists.txt`, `src/ggml-opencl.cpp`, каталог `kernels/`.
-
-Пресет `opencl-arc` пишет в `build-opencl-arc`. Эта сборка идёт в отдельный каталог `build-our-ocl`, теми же флагами:
-
-```bash
-OCL=/path/to/qnn-backend-ocl
-DST=ggml/src/ggml-opencl
-rm -rf "$DST"
-mkdir -p "$DST"
-cp "$OCL/src/CMakeLists.txt" "$OCL/src/ggml-opencl.cpp" "$DST/"
-cp -a "$OCL/kernels" "$DST/kernels"
-
-cmake -S . -B build-our-ocl -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_OPENCL=ON \
-  -DGGML_RPC=ON \
-  -DGGML_OPENCL_EMBED_KERNELS=ON \
-  -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
-  -DGGML_OPENCL_SOA_Q=ON \
-  -DGGML_OPENCL_PROFILING=OFF \
-  -DGGML_OPENCL_TARGET_VERSION=300 \
-  -DLLAMA_CURL=OFF
-cmake --build build-our-ocl -j --target llama-cli ggml-rpc-server
-```
-
-Нужны заголовки OpenCL, Ninja и Python 3: ядра вшиваются `kernels/embed_kernel.py`. Ядра Adreno выключены.
-
-Сервер из `build-our-ocl/bin`:
-
-```bash
-NEO_DISABLE_CACHE=1 LD_LIBRARY_PATH=$PWD ./ggml-rpc-server -H 0.0.0.0 -p 18769
-```
-
-Клиент из того же дерева. Версия клиента и сервера — `10.0.1`.
-
-```bash
-LD_LIBRARY_PATH=build-our-ocl/bin ./build-our-ocl/bin/llama-cli \
-  --rpc HOST:18769 -dev RPC0 -ngl 99 \
-  -m model.gguf -p 'Hello' -n 16 --temp 0 -s 1 -c 512 -st
-```
+Здесь только overlay этого backend: после патча `0002` каталог `ggml/src/ggml-opencl` заменяется файлами отсюда (`src/CMakeLists.txt`, `src/ggml-opencl.cpp`, `kernels/`). Заголовок `ggml/include/ggml-opencl.h` остаётся из llama.cpp. Команды cmake и сервера — раздел **RPC+OCL** в README RPC, каталог `build-our-ocl`.
 
 Баннер: `Starting RPC server v10.0.1`. Устройство на прогоне: Intel Arc Pro B60, OpenCL 3.0.
 
@@ -172,10 +136,27 @@ Tensor IR и свой ICD остаются целью репозитория. Г
 | `src/` | Stage-1 диспетчер графа (архив inbox) |
 | `kernels/` | OpenCL C — временный LL до ICD QNN |
 | `ir/` | Tensor IR (рабочая копия) |
-| `tools/quantize/` | конвертер весов + отчёт ошибки по тензору |
+| `tools/quantize/` | указатель → QuantumNN (encode / типы / REPRO-fp8) |
 | `docs/` | MCP_IR, план вех |
 | `log/` | журнал; конфиг Qwen/arc3 |
 
+
+
+## Направления (указатель · чтобы не каша)
+
+Один репозиторий — несколько контуров. Читать по строке, не смешивать.
+
+| контур | где | сейчас |
+|--|--|--|
+| Stage-1 llama OpenCL | `src/ggml-opencl.cpp`, `kernels/` | речь Qwen/Gemma на B60 через RPC 10.0.1 |
+| Tensor IR + речь | `ir/` (`mcp_ir_*`, MCP `ir_say`) | host LL ок; **ocl MUL_MAT** есть (`ir_mul_mat`); B60-сверка отдельно → `ir/STUMBLE.md` |
+| Quantize | `QuantumNN/tools/quantize/` | BF16/F16 → свой f8 (канон) |
+| Воспитание [[qwen]] | `log/qwen/` | METHOD/KNOWLEDGE; CUDA120 — полигон, не цель репо |
+| Полигон CUDA ≥12.0 | `log/qwen/cuda120/`, индекс `log/qwen/index/` | только разбор / RPC+CUDA позже; не зоопарк arch |
+| Сосед RPC | `qnn-backend-rpc` | канон cmake/сборки; флот |
+| Path A (не этот продукт) | `godminer/opencl/` | stubs; не сливать без постановки |
+
+**Сейчас:** ocl **MUL_MAT** на OpenCL LL закрыт (прогон Blackwell OpenCL). B60 — сверка когда карта жива. CUDA/qwen полигон — не этот ход.
 
 ## Публичность
 
