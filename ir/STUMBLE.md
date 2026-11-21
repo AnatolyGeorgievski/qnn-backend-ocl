@@ -19,7 +19,7 @@ arc2 без GPU в PCI — 0 platforms нормален для этой маши
 Чат: `http://192.168.1.187:18081/` · MCP `fetch` + `mcp-ir` (`ir_say`).
 
 ## Сейчас
-MUL_MAT ocl LL закрыт, в т.ч. на B60 (phantom). Следующий пазл — отдельно.
+MUL_MAT ocl LL закрыт; **Q4_K / Q6_K** на B60 приняты (tinyllama pure). Следующий пазл — отдельно.
 
 ## Приёмка RPC+OCL · 2026-11-21
 
@@ -30,7 +30,9 @@ phantom `192.168.1.185:18769`, `GGML_OPENCL_DEVICE=B60`, сервер `llama-our
 |--|--|
 | tinyllama Q4_0 | OK, речь |
 | gemma-4-E4B Q4_0 | OK, «Hello! How can I help you today?» · 38.8 / 20.3 t/s |
-| Qwen2.5-0.5B | FAIL: `Qcur-0` MUL_MAT not supported (не приёмка) |
+| tinyllama **Q4_K** pure | OK · 271.3 / 91.1 t/s |
+| tinyllama **Q6_K** pure | OK · 237.8 / 91.1 t/s |
+| Qwen2.5-0.5B Q4_K_M | вне приёмки: внутри есть `q5_0` |
 
 arc2 без GPU — OpenCL там не ждать. Pid: `/home/george/rpc-server.pid` на phantom.
 
@@ -46,6 +48,8 @@ arc3 `192.168.1.187:18767`, `ggml-rpc-server -d CUDA0,CUDA1`, v10.0.1.
 
 Пара OCL `:18769` (B60) и CUDA `:18767` — один протокол 10.0.1.
 
+Кванты приёмки ocl: **Q4_0 · Q4_K · Q6_K** (и соседние K). `Q5_0` / `Q5_1` — не берём.
+
 ## Dual-path · 2026-11-21 19:18 UTC
 
 Один клиент arc3 `llama-cli` 10.0.1, одна фраза `Hello`, `-n 48 --temp 0 -st -ngl 99`,
@@ -57,3 +61,9 @@ arc3 `192.168.1.187:18767`, `ggml-rpc-server -d CUDA0,CUDA1`, v10.0.1.
 | OCL B60 | `192.168.1.185:18769` | Hello! How can I help you today? | 39.0 / 20.4 t/s · wall 29.4s |
 
 Текст ответа совпал. На arc3 параллельно живёт llama-server (~20 GiB/GPU) — CUDA RPC всё равно вместился.
+
+## Q5_0 · заметка · 2026-11-21
+
+Qwen2.5-0.5B Q4_K_M: `Qcur-0` = MUL_MAT `src0=q5_0` × f32. `supports_op` раньше обещал Q5_0/Q5_1 без ветки — падение.
+Ядро `kernel_mul_mat_q5_0_f32` на B60 речь давало (331.8 / 62.5 t/s) — откатили: тип редкий, тянуть через приёмку/валидации нет смысла.
+Оставлено в логе на случай; в коде и `supports_op` — не держим.

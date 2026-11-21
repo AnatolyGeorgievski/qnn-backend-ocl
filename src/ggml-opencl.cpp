@@ -2456,8 +2456,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             } else if (
                        op->src[0]->type == GGML_TYPE_Q4_0 ||
                        op->src[0]->type == GGML_TYPE_Q4_1 ||
-                       op->src[0]->type == GGML_TYPE_Q5_0 ||
-                       op->src[0]->type == GGML_TYPE_Q5_1 ||
                        op->src[0]->type == GGML_TYPE_Q8_0 ||
 					   op->src[0]->type == GGML_TYPE_Q4_K ||
                        op->src[0]->type == GGML_TYPE_Q5_K ||
@@ -7348,7 +7346,6 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
             CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_uint),      &ne1));
 #endif
             break;
-
         case GGML_TYPE_Q4_1:
 			kernel = backend_ctx->kernel_mul_mat_q4_1_f32;
             if (ne12*ne13==1) {
@@ -7585,7 +7582,11 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
         default:
             if (false && "not implemented") {
             } else {
-                GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");
+                GGML_LOG_ERROR("qnn_ocl: mul_mat UNIMP src0=%s src1=%s dst=%s | %s(%lld,%lld,%lld) x %s(%lld,%lld,%lld) -> %s\n",
+                    ggml_type_name(src0t), ggml_type_name(src1t), ggml_type_name(dst->type),
+                    src0->name, (long long)ne00, (long long)ne01, (long long)ne02,
+                    src1->name, (long long)ne10, (long long)ne11, (long long)ne12,
+                    dst->name);
                 qnn_op_bad = 1;
                 return;
             }
