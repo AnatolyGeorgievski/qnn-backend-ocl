@@ -19,7 +19,9 @@ arc2 без GPU в PCI — 0 platforms нормален для этой маши
 Чат: `http://192.168.1.187:18081/` · MCP `fetch` + `mcp-ir` (`ir_say`).
 
 ## Сейчас
-**SSM_CONV** и **SOFTPLUS** на ocl закрыты (прогон 27B Q6_K на B60). Дальше стоп: **GATED_DELTA_NET** (`node_49`) — отдельный пазл.
+Очередь: `log/qwen/ROAD.md` — **GATED_DELTA_NET** речь 27B.
+Gemma MoE 26B-A4B на ocl: ARGSORT · MUL_MAT_ID · CLAMP — речь ок.
+27B: CPY · SSM_CONV · SOFTPLUS · GDN kernel ок vs CPU; речь ещё нет (`<|im_end|>`).
 
 ## Приёмка RPC+OCL · 2026-11-21
 
@@ -93,3 +95,32 @@ Qwen3.5 / 3.8 hybrid: `linear_conv_kernel_dim=4` → `ggml_ssm_conv`. CUDA ум�
 
 phantom B60 `:18769`, Qwen3.5-27B Q6_K, клиент arc3.
 После CPY: **SSM_CONV** ок → **SOFTPLUS** (`a_softplus`) ок → FAIL: `GATED_DELTA_NET` `node_49`.
+
+## Gemma 4 · 2026-11-22
+
+| модель | ocl B60 |
+|--|--|
+| E4B Q4_0 | OK · та же фраза что CUDA |
+| 12B Q4_0 (`ggml-org`) | OK · Hello! How can I help you today? · 18 / 13.8 t/s |
+| 26B-A4B Q4_0 | OK · Hello! How can I help you today? · 28.1 / 20.9 t/s |
+
+## ARGSORT · 2026-11-22
+
+Bitonic `kernel_argsort_f32_i32` (как upstream ocl / CUDA). f32→i32, сплошной src, pad 2^n ≤ max_wg (B60: 1024).
+Прогон 26B-A4B Q4_0 на phantom `:18769`: ARGSORT прошёл; стоп `MUL_MAT_ID` `ffn_moe_gate_up-0`.
+
+## MUL_MAT_ID · CLAMP · 2026-11-22
+
+`kernel_mul_mv_id_q4_0_f32_8x_flat` (SOA Q4_0, expert ids). После ARGSORT+MMID стоп был `CLAMP` workgroup (−54): local должен делить nelements.
+Прогон 26B-A4B Q4_0 B60 `:18769`: речь «Hello! How can I help you today?» · 28.1 / 20.9 t/s.
+
+## GATED_DELTA_NET · 2026-11-22
+
+Ядро `kernel_gated_delta_net` (столбец=нить, S_v≤128) + host. Эталон CPU/CUDA.
+`test-backend-ops` на B60: **43/43** GDN (без L2 в первом прогоне) OK — в т.ч. 128, GQA v_repeat, K>1, permuted, KDA.
+SSM_CONV / SOFTPLUS / CONCAT / RMS_NORM / SCALE / FLASH hsk=256 / ROPE mode=40 — OK.
+Smoke Qwen3.5-27B Q6_K B60 `:18769`: граф живёт, gen ~8 t/s, первый токен `<|im_end|>` (chat) или петля `<think>` (no-jinja). Gemma E4B на том же сервере — речь ок.
+`get_alloc_size`: убран `GGML_PAD` (pad > nbytes ломал assert harness).
+`rms_norm_mul` fusion: eps брать с узла RMS_NORM, не MUL.
+`L2_NORM` ядро добавлено (разблокирует GDN+L2 тесты).
+Дальше: состав hybrid-пути вне unit (state CPY / softplus×a / rms+scale на wide view) — пока GDN сам не виноват по NMSE.

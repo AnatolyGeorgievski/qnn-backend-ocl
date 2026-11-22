@@ -1185,6 +1185,180 @@ kernel void kernel_ssm_conv(
     *(global float *)(dst + offd + (ulong) i1 * nb0 + (ulong) i2 * nb1 + (ulong) i3 * nb2) = sum;
 }
 
+// ARGSORT. Bitonic по строке: src0 f32 → dst i32 (индексы). ne00_pad = 2^ceil(log2(ne00)).
+// Порядок: 0 ASC, 1 DESC. Индексы ≥ ne00 — паддинг, в сравнении уходят в конец.
+#define ARGSORT_SWAP(x, y) { int tmp = (x); (x) = (y); (y) = tmp; }
+
+kernel void kernel_argsort_f32_i32(
+        global char * src0,
+        ulong off0,
+        global char * dst,
+        ulong offd,
+        int ne00,
+        int ne00_pad,
+        int order,
+        local int * dst_row
+) {
+    int col = get_local_id(0);
+    int row = get_group_id(1);
+
+    if (col >= ne00_pad) {
+        return;
+    }
+
+    global const float * x_row = (global const float *)(src0 + off0) + (ulong) row * (ulong) ne00;
+
+    dst_row[col] = col;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int k = 2; k <= ne00_pad; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (dst_row[col] >= ne00 ||
+                        (dst_row[ixj] < ne00 && (order == 0 ?
+                            x_row[dst_row[col]] > x_row[dst_row[ixj]] :
+                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                    ) {
+                        ARGSORT_SWAP(dst_row[col], dst_row[ixj]);
+                    }
+                } else {
+                    if (dst_row[ixj] >= ne00 ||
+                        (dst_row[col] < ne00 && (order == 0 ?
+                            x_row[dst_row[col]] < x_row[dst_row[ixj]] :
+                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                    ) {
+                        ARGSORT_SWAP(dst_row[col], dst_row[ixj]);
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (col < ne00) {
+        ((global int *)(dst + offd))[row * ne00 + col] = dst_row[col];
+    }
+}
+
+
+//------------------------------------------------------------------------------
+// GATED_DELTA_NET. Одна нить — один столбец состояния (S_v <= 128).
+// Как CPU: S *= exp(g); delta=(v − Sᵀk)·β; S += k·delta; attn = Sᵀq / √S_v.
+// dst = [attn | state_snapshots].
+//------------------------------------------------------------------------------
+#define GDN_MAX_SV 128
+
+kernel void kernel_gated_delta_net(
+        global char * q,     ulong off_q,
+        global char * k,     ulong off_k,
+        global char * v,     ulong off_v,
+        global char * g,     ulong off_g,
+        global char * beta,  ulong off_b,
+        global char * state, ulong off_s,
+        global char * dst,   ulong off_d,
+        int S_v,
+        int H,
+        int n_tokens,
+        int n_seqs,
+        int neq1,
+        int rq3,
+        int kda,
+        int K_slots,
+        int sq1, int sq2, int sq3,
+        int sk1, int sk2, int sk3,
+        int sv1, int sv2, int sv3,
+        int sb1, int sb2, int sb3,
+        int sg1, int sg2, int sg3,
+        int state_seq_stride
+) {
+    const int col  = (int) get_global_id(0);
+    const int head = (int) get_global_id(1);
+    const int seq  = (int) get_global_id(2);
+    if (col >= S_v || head >= H || seq >= n_seqs || S_v <= 0 || S_v > GDN_MAX_SV) {
+        return;
+    }
+
+    global const float * q_base = (global const float *)(q + off_q);
+    global const float * k_base = (global const float *)(k + off_k);
+    global const float * v_base = (global const float *)(v + off_v);
+    global const float * g_base = (global const float *)(g + off_g);
+    global const float * b_base = (global const float *)(beta + off_b);
+    global const float * s_in   = (global const float *)(state + off_s);
+    global float * dst_f        = (global float *)(dst + off_d);
+
+    const float scale = native_rsqrt((float) S_v);
+    const int iq1 = head % neq1;
+    const int iq3 = (rq3 > 0) ? (seq / rq3) : seq;
+
+    // load column: M[col][i] = S[i][col], contiguous
+    float s[GDN_MAX_SV];
+    {
+        global const float * row = s_in + seq * state_seq_stride + head * S_v * S_v + col * S_v;
+        for (int i = 0; i < S_v; ++i) {
+            s[i] = row[i];
+        }
+    }
+
+    const int attn_elems = S_v * H * n_tokens * n_seqs;
+    const int state_per_snap = S_v * S_v * H * n_seqs;
+    global float * attn_base  = dst_f;
+    global float * state_out  = dst_f + attn_elems;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        global const float * q_t = q_base + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        global const float * k_t = k_base + iq3 * sk3 + t * sk2 + iq1 * sk1;
+        global const float * v_t = v_base + seq * sv3 + t * sv2 + head * sv1;
+        const float beta_val = b_base[seq * sb3 + t * sb2 + head * sb1];
+        global const float * g_t = g_base + seq * sg3 + t * sg2 + head * sg1;
+
+        if (kda) {
+            for (int i = 0; i < S_v; ++i) {
+                s[i] *= exp(g_t[i]);
+            }
+        } else {
+            const float g_exp = exp(g_t[0]);
+            for (int i = 0; i < S_v; ++i) {
+                s[i] *= g_exp;
+            }
+        }
+
+        float kv = 0.f;
+        for (int i = 0; i < S_v; ++i) {
+            kv += s[i] * k_t[i];
+        }
+        const float delta = (v_t[col] - kv) * beta_val;
+        for (int i = 0; i < S_v; ++i) {
+            s[i] += k_t[i] * delta;
+        }
+
+        float attn = 0.f;
+        for (int i = 0; i < S_v; ++i) {
+            attn += s[i] * q_t[i];
+        }
+        attn_base[(seq * n_tokens * H + head) * S_v + t * H * S_v + col] = attn * scale;
+
+        if (K_slots > 1) {
+            const int target_slot = n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K_slots) {
+                global float * row = state_out + target_slot * state_per_snap
+                    + (seq * H + head) * S_v * S_v + col * S_v;
+                for (int i = 0; i < S_v; ++i) {
+                    row[i] = s[i];
+                }
+            }
+        }
+    }
+
+    if (K_slots <= 1) {
+        global float * row = state_out + (seq * H + head) * S_v * S_v + col * S_v;
+        for (int i = 0; i < S_v; ++i) {
+            row[i] = s[i];
+        }
+    }
+}
+
 //------------------------------------------------------------------------------
 // unary
 //------------------------------------------------------------------------------
@@ -1955,6 +2129,54 @@ kernel void kernel_rms_norm(
     }
     work_group_barrier(CLK_LOCAL_MEM_FENCE);
     float scale = rsqrt(stripe[0] / (float) ne00 + eps);
+    global float * y = (global float *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        y[i] = x[i] * scale;
+    }
+}
+//------------------------------------------------------------------------------
+// l2_norm — как rms_norm, но scale = 1/sqrt(sum + eps), без /ne00
+//------------------------------------------------------------------------------
+kernel void kernel_l2_norm(
+        global char * src0, ulong off0,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb1, ulong nb2, ulong nb3,
+        float eps,
+        local float * stripe
+){
+    uint lid = get_local_id(0);
+    uint r0  = get_group_id(0);
+    uint span = ne02 * ne01;
+    uint i03 = r0 / span;
+    uint i02 = (r0 - i03 * span) / ne01;
+    uint i01 = r0 - i03 * span - i02 * ne01;
+    global float * x = (global float *) (src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    float sumf = 0.f;
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = x[i];
+        sumf += xi * xi;
+    }
+    sumf = sub_group_reduce_add(sumf);
+    if (get_sub_group_local_id() == 0) {
+        stripe[get_sub_group_id()] = sumf;
+    } else {
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float s = 0.f;
+        uint n = get_num_sub_groups();
+        for (uint k = 0; k < n; ++k) {
+            s += stripe[k];
+        }
+        stripe[0] = s;
+    } else {
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    float scale = rsqrt(stripe[0] + eps);
     global float * y = (global float *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
         y[i] = x[i] * scale;
@@ -5149,4 +5371,143 @@ kernel void kernel_mul_mat_q4_0_f32_8x_flat(
     dst = (global float*)((global char*)dst + offsetd);
 
     mul_vec_q_n_f32_8x_flat(src0_q, src0_d, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
+}
+
+// MUL_MAT_ID. Тот же mul_vec 8x flat, но expert выбирается по ids (src2). im в mul_vec = 0:
+// срез эксперта уже сдвинут в указателях.
+inline void mul_vec_q_n_f32_8x_flat_im0(
+        global uchar * src0_q,
+        global half  * src0_d,
+        global float * src1,
+        global float * dst,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    const ulong nb = ne00/QK4_0;
+
+    int r0 = get_group_id(0);
+    int r1 = get_group_id(1);
+    int im = 0;
+
+    int first_row = (r0 * N_SIMDGROUP + get_sub_group_id()) * N_DST;
+
+    int i12 = im%ne12;
+    int i13 = im/ne12;
+
+    ulong offset0_d = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    ulong offset0_q = (first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02)) * (QK4_0/2);
+
+    global uchar * x = (global uchar *) src0_q + offset0_q;
+    global half  * d = (global half  *) src0_d + offset0_d;
+    global float * y = (global float *) src1   + r1*ne10 + im*ne00*ne1;
+
+    float8 sumf = 0.f;
+
+    int ix = get_sub_group_local_id();
+
+    global float * yb = y + ix*QK4_0;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH) {
+        float16 yl = vload16(0, yb);
+        float16 yh = vload16(1, yb);
+        for (uint row = 0; row < N_DST; row++)
+            sumf[row] += block_q_4_0_dot_y_flat(x + (ib + row*nb)*(QK4_0/2), d[ib + row*nb], yl, yh);
+        yb += QK4_0 * (N_SIMDWIDTH);
+    }
+
+    float8 tot = (float8)(
+        sub_group_reduce_add(sumf.s0), sub_group_reduce_add(sumf.s1),
+        sub_group_reduce_add(sumf.s2), sub_group_reduce_add(sumf.s3),
+        sub_group_reduce_add(sumf.s4), sub_group_reduce_add(sumf.s5),
+        sub_group_reduce_add(sumf.s6), sub_group_reduce_add(sumf.s7)
+    );
+
+    if (get_sub_group_local_id() == 0) {
+        if (first_row + 0 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 0] = tot.s0;
+        }
+        if (first_row + 1 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 1] = tot.s1;
+        }
+        if (first_row + 2 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 2] = tot.s2;
+        }
+        if (first_row + 3 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 3] = tot.s3;
+        }
+        if (first_row + 4 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 4] = tot.s4;
+        }
+        if (first_row + 5 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 5] = tot.s5;
+        }
+        if (first_row + 6 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 6] = tot.s6;
+        }
+        if (first_row + 7 < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + 7] = tot.s7;
+        }
+    }
+}
+
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_16
+#elif defined (ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mv_id_q4_0_f32_8x_flat(
+        global uchar * src0_q,
+        global half  * src0_d,
+        global float * src1,
+        ulong          offset1,
+        global char  * src2,
+        ulong          offset2,
+        global float * dst,
+        ulong          offsetd,
+        int            ne00,
+        int            ne01,
+        int            ne02,
+        ulong          nb00,
+        ulong          nb02,
+        int            ne10,
+        int            ne11,
+        int            ne12,
+        ulong          nb11,
+        ulong          nb12,
+        int            ne20,
+        int            ne21,
+        ulong          nb21,
+        int            ne0,
+        int            ne1,
+        int            r2,
+        int            r3
+) {
+    src1 = (global float *)((global char *)src1 + offset1);
+    src2 = (global char  *)((global char *)src2 + offset2);
+    dst  = (global float *)((global char *)dst  + offsetd);
+
+    const int iid1 = get_group_id(2)/ne20;
+    const int idx  = get_group_id(2)%ne20;
+
+    const int i02 = ((global int *)(src2 + iid1*nb21))[idx];
+
+    const int i11 = idx%ne11;
+    const int i12 = iid1;
+
+    const int i1 = idx;
+    const int i2 = i12;
+
+    global uchar * src0_q_cur = src0_q + (i02*nb02/nb00)*(QK4_0/2);
+    global half  * src0_d_cur = src0_d + (i02*nb02/nb00);
+    global float * src1_cur   = (global float *)((global char *) src1  + i11*nb11 + i12*nb12);
+    global float * dst_cur    = dst + i1*ne0 + i2*ne1*ne0;
+
+    mul_vec_q_n_f32_8x_flat_im0(src0_q_cur, src0_d_cur, src1_cur, dst_cur, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
 }

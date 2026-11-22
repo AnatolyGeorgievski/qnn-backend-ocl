@@ -6,6 +6,11 @@
         "--ignore-robots-txt"
       ],
       "timeout_ms": 120000
+    },
+    "mcp-ir": {
+      "command": "/home/george/bin/mcp-ir",
+      "args": [],
+      "timeout_ms": 120000
     }
   }
 }
