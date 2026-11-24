@@ -36,3 +36,20 @@ OCL is slower but text can match.
 - `rms_norm_mul` fusion: epsilon from the RMS_NORM node.
 
 Full op matrices and model tables: root `ChangeLog`.
+
+## Hybrid Qwen3.5 speech · repro 2026-11-24
+
+Server: phantom `llama-our-ocl-1001` RPC `:18769`, `GGML_OPENCL_DEVICE=B60`.
+Client: arc3 `llama-cli` `0cce758`, model `Qwen3.5-27B-Q6_K`.
+
+| flags | visible output | rate |
+|--|--|--|
+| default / jinja (chat) | empty (specials hidden) | gen ~0 or silent EOS |
+| `--jinja --reasoning off -sp` | first token **`<\|im_end\|>`** | ~7.8–7.9 t/s |
+| `--no-jinja --reasoning off` | loop **`<think>`** | ~8.2 t/s |
+
+Graph runs (prompt ~4–5 t/s). Not a missing-op crash. Same class of bug as 2026-11-22 smoke.
+CUDA dual-path today: RPC `:18767` not ready (GPU busy with local llama-server).
+
+Next cut: first-token logits OCL vs CUDA/CPU on the same prompt (free CUDA slot or smaller hybrid).
+
