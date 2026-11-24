@@ -1,5 +1,87 @@
 # ChangeLog
 
+## 2026-11-24
+
+Intel Arc Pro B60, RPC 10.0.1, overlay `llama-our-ocl-1001` / `build-rpc-ocl`. Unit: `test-backend-ops` vs CPU. Models: `llama-cli --rpc … -dev RPC0 -ngl 99`, temp 0.
+
+### Ops matrix (blockers → QNN/hybrid)
+
+Priority in `docs/OPS_LADDER.CONTRACT.md`: **RMS_NORM+fused → SSM family → rest**. Mem manager (heap/slices) deferred for on-demand MoE. IR ladder: `OP → cmd_template` (doc).
+
+- RMS family recheck: RMS_NORM **121/121**, RMS_NORM_MUL_ADD **113/113**, ADD_RMS_NORM **25/25**, RMS_NORM_SCALE **10/10**.
+- SSM family: SSM_CONV **60/60**, GDN **43/43**, **SSM_SCAN 17/17** (OpenCL `kernel_ssm_scan` + host `ggml_cl_ssm_scan`; Mamba-1 + Mamba-2 shapes from unit).
+- Связка примитивов SSM (`SSM_CONV`, `SSM_SCAN`) и GDN (`GATED_DELTA_NET`) нужна, чтобы запускать гибридные модели: слои Mamba/scan и слои Gated DeltaNet живут в одном графе (Qwen3.5 / Qwen3.6). По отдельности unit зелёный, но без обеих веток гибрид на B60 не стартует.
+- `SOFTPLUS` bf16: f32 softplus + `convert_f32_to_bf16`; `supports_op` no longer claims other unary bf16 via contiguous. **10/10**.
+- Model smoke (local OCL): tinyllama Q4_0 `-ngl 99` — coherent gen ~118 t/s after RMS/SSM unit green.
+- Pure SSM model: **state-spaces/mamba-130m-hf** F16 (`mradermacher` GGUF). Q8_0 rejected by loader (`ssm_dt.weight` rows not multiple of 32). Smoke `-ngl 99` B60: loads, SSM state cpy path live; greedy seed42 matches CPU (`The capital of France is` → same continuation). Tiny base model ≠ speech quality target.
+- CPY bf16: fix `bf16→f32` (was loading as IEEE half → Inf); add `f16↔bf16`. Unit `-o CPY -p bf16` **23/23**.
+- SCALE bf16: was float8/strided-as-f32 on 2-byte elems → sentinel/Inf; `kernel_scale_bf16` (+ strided). Unit **11/11**.
+- SOFTPLUS f32/f16/bf16, including strided bf16 view: unit **12/12**.
+- CPY among f32, f16, bf16, Q8_0: f32/f16/bf16→Q8_0 and Q8_0→f32 on device (block 32, round-nearest-even, same shape as AVX `quantize_row_q8_0`). Unit CPY **175/176**. f32→Q8_0, f16→Q8_0, Q8_0→f32 and contiguous Q8_0→Q8_0 pass. bf16→Q8_0 on `[256,4,4,4]` is the miss. Unary SOFTPLUS on Q8_0 is not a CPU op.
+- Округление Q8_0, не «2.12× допуска». Число 2.12 в журнале было шуткой (Высоцкий, «Песенка про прыгуна в высоту»), не пределом.
+  Шаг блока Δ = amax/127. Правильное округление: ошибка равномерна на [-Δ/2, Δ/2], дисперсия Δ²/12. Стохастическое: при дробной части f кидаем вверх с вероятностью f, E[ε²|f] = f(1-f)Δ², по f равномерному на [0,1] выходит Δ²/6.
+  Отношение СКО остатка к СКО одного правильного округления:
+  · √2 — два независимых правильных, Var(δ) = 2·(Δ²/12);
+  · √3 — стохастическое минус правильное, Var(δ) = Δ²/6 + Δ²/12 = Δ²/4 = 3·(Δ²/12).
+  При правильном округлении этот множитель лежит от √2 до √3. 2.12 в эту полосу не входит.
+  Тип e- у самого шума квантования, стохастический предел. x равномерно на [-A, A], A = 150, amax ~ A, E[x²] = A²/3. NMSE = (Δ²/6) / (A²/3) = 1/(2·127²) ≈ 3.1×10^{-5}, тип e-5. Правильное округление вдвое тише: 1/(4·127²) ≈ 1.55×10^{-5}, тот же тип e-5.
+  Допуск harness — другой предмет: один элемент мимо на 150/64, знаменатель (A²/4)·N. Для N = 256·4·4·4 = 16384 бюджет 1/(1024·N) ≈ 6×10^{-8}, тип e-8. Отношение предела e-5 к этому бюджету не говорит, насколько GPU совпал с CPU.
+- Remaining OCL matrix (not blockers for hybrid thesis): bf16→Q8_0 on `[256,4,4,4]`. Множитель к СКО правильного округления должен быть в [√2, √3]; предел шума — тип e-5, см. вывод выше.
+
+### Decision · hybrid CPU + next
+
+- **Split by layer:** some layers stay on **CPU when CPU pulls them**; heavy / winning GPU ops stay on OCL (B60). Not «all GPU».
+- **CPU BF16/FP16 quants** (QuantumNN `qnn.h` / `qnn_gguf.c` exercises → future **qnn-backend-cpu**): only under hardware ISA **`AVX*BF16` / `AVX*FP16`** (and kin). No silent scalar emulate as native path. Dispatch by CPUID.
+- **CPU matrix ops** (dpbf16 / FP16 matmul class): plan for **Nova Lake** (next year). Until then: contract + scaffolding only; live matrix on OCL.
+- Source map (no local `ggml-cpu-quants.c`): upstream is `ggml-cpu/quants.c` + `arch/x86/quants.c`; our work lives in **QuantumNN**.
+
+- Xfer probe: `GGML_OCL_XFER_PROBE=1` logs first N (`GGML_OCL_XFER_PROBE_N`, default 32) hits of buffer `cpy` / `cpy_n` / `set|get_2d` / `set|get_n`, async `set|get_2d`, OP `cl_cpy`, and stub `cpy_async` (wired, returns false until real path). Use on Qwen3.5 to see which host↔device paths are demanded.
+
+**Next (this repo / now):** **Qwen3.5-27B speech recheck** on B60 with xfer probe on (model download `Qwen3.5-27B.Q6_K.gguf` ~22 GB). Then SCALE bf16 if needed; IR/offsets; CPU backend later (Nova Lake for matrix).
+
+### L2_NORM / env
+
+- `L2_NORM`: scale matched CPU (`1/max(sqrt(sum), eps)`, was wrong `rsqrt(sum+eps)`); kernel takes `nb00`/`nb0` (views + permute). **31 ok / 0 fail / 0 skip**.
+- `GGML_OPENCL_FINITE_MATH`: `1` (default) keeps `-cl-finite-math-only -cl-fast-relaxed-math -cl-unsafe-math-optimizations`; `0` drops them.
+- f16 `MUL`/`ADD`: native half `*`/`+` on B60 → NaN. Now `fma` in f32 + `convert_half_rte` (same shape as `gelu_f16` / `softplus_f16`). Flat/row use `half8` + typed host path (was float8/`sizeof(float)` on f16).
+- `RMS_NORM`: typed ladder f32 / f16 / bf16. Accumulate + `rsqrt` in f32; store via round convert. **121/121**.
+- bf16 `ADD`/`MUL` (same + mixed `bf16×f32`): f32 `fma` + `convert_f32_to_bf16`. Unblocks `RMS_NORM_MUL_ADD` bf16 (**113/113**).
+
+### Unit ops (ok / fail / skip)
+
+| op | ok | fail | skip | verdict |
+|--|--:|--:|--:|--|
+| L2_NORM | 31 | 0 | 0 | ok |
+| RMS_NORM | 121 | 0 | 0 | ok f32+f16+bf16 (sum/scale f32; store `convert_half_rte` / `convert_f32_to_bf16`) |
+| SSM_CONV | 60 | 0 | 0 | ok |
+| GATED_DELTA_NET | 43 | 0 | 0 | ok |
+| ARGSORT | 46 | 0 | 52 | ok |
+| MEAN | 17 | 0 | 0 | ok |
+| SUM_ROWS | 11 | 0 | 0 | ok |
+| REPEAT | 18 | 0 | 0 | ok |
+| SSM_SCAN | 17 | 0 | 0 | ok (Mamba-1/2 unit shapes) |
+| SOFTPLUS | 12 | 0 | 0 | ok f32+f16+bf16, strided view included |
+| SCALE | 11 | 0 | 0 | ok f32+bf16 (bf16: f32 fma + convert; not float8) |
+| CPY | 175 | 1 | rest | f32/f16/bf16↔Q8_0; fail bf16→Q8_0 `[256,4,4,4]`; полоса СКО [√2, √3], предел шума e-5 |
+| MUL f32 | 48 | 0 | 0 | ok |
+| MUL f16 | 46 | 0 | 0 | ok (f32 fma + `convert_half_rte`) |
+| ADD f32 | 58 | 0 | 0 | ok |
+| ADD f16 | 47 | 0 | 0 | ok (same path as MUL f16) |
+
+### Models (speech)
+
+| model | quant | speech | note |
+|--|--|--|--|
+| tinyllama | Q4_K | **ok** | Hello → coherent continuation; ~90 t/s gen |
+| Qwen2.5-Coder-7B-Instruct | Q4_0 | **ok** | chat reply; ~28 t/s gen |
+| Gemma-4 E4B | Q4_0 | **ok** | jinja; ~27 t/s gen |
+| Gemma-4 26B-A4B | Q4_0 | **ok** | MoE; ~20 t/s gen |
+| Qwen3.5-27B | Q6_K | **weak** | recheck B60 `-c 512 -ngl 99`: graph ok ~10 t/s gen; `--no-jinja` emits `<think>` + English scratchpad (not crash). Still not clean speech. Xfer probe: heavy `cpy_async` stub (false→`cl_cpy`), `get_n` once; no `_2d` this run |
+| mamba-130m-hf | F16 | **ops ok** | pure linear SSM; unit SSM_SCAN green; greedy=CPU. Not a speech-quality model |
+
+Matrix: RMS+SSM · CPY bf16 · SOFTPLUS bf16 — closed. Qwen3.5 speech **weak** (think-path). **Next:** implement real `cpy_tensor_async` (probe shows demand); clean Qwen3.5 first-token/speech; SCALE bf16 if needed.
+
+
 ## 2026-11-19
 
 Intel Arc Pro B60, наш RPC 10.0.1, сборка `build-our-ocl`. Ниже операции, без которых Gemma3n обрывалась до фразы, и что модели говорят после них.

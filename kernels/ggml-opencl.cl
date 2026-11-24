@@ -679,9 +679,37 @@ inline void quantize_q8_K(float * x, struct block_q8_K *y) {
     y->qs[ix] = q;
 }
 #endif
+
+// f16 binary: native half */+ on B60 gives NaN. Mul/add in f32 via fma, round RTE.
+// Same shape as gelu_f16 / softplus_f16: float work, convert_half_rte out.
+inline half add_f16(half a, half b) {
+    return convert_half_rte(fma((float)a, 1.f, (float)b));
+}
+inline half mul_f16(half a, half b) {
+    return convert_half_rte(fma((float)a, (float)b, 0.f));
+}
+inline half8 OVERLOADABLE add_f16_8(half8 u, half8 v) {
+    return convert_half8_rte(fma(convert_float8(u), (float8)(1.f), convert_float8(v)));
+}
+inline half8 OVERLOADABLE mul_f16_8(half8 u, half8 v) {
+    return convert_half8_rte(fma(convert_float8(u), convert_float8(v), (float8)(0.f)));
+}
+
+// bf16 convert helpers live later; declare for kernels below.
+static inline float  OVERLOADABLE convert_bf16_to_f32(ushort u);
+static inline ushort OVERLOADABLE convert_f32_to_bf16(float x);
+inline ushort add_bf16(ushort a, ushort b) {
+    return convert_f32_to_bf16(fma(convert_bf16_to_f32(a), 1.f, convert_bf16_to_f32(b)));
+}
+inline ushort mul_bf16(ushort a, ushort b) {
+    return convert_f32_to_bf16(fma(convert_bf16_to_f32(a), convert_bf16_to_f32(b), 0.f));
+}
+
 //------------------------------------------------------------------------------
 // add
 //------------------------------------------------------------------------------
+// TODO(kernels): убрать offset*/off* из аргументов; смещение считать на хосте
+// (sub-buffer / указатель на первый элемент), в ядре не делать src += offset.
 
 // general-purpose kernel for addition of two tensors
 // pros: works for non-contiguous tensors, supports broadcast across dims 1, 2 and 3
@@ -690,26 +718,19 @@ kernel void kernel_add(
         global char * src0,
         global char * src1,
         global char * dst,
-        uint   ne00,
-        uint   ne01,
-        uint   ne02,
-        uint   ne03,
         ulong nb00,
         ulong nb01,
         ulong nb02,
         ulong nb03,
         uint  ne10,
-        uint   ne11,
-        uint   ne12,
-        uint   ne13,
+        uint  ne11,
+        uint  ne12,
+        uint  ne13,
         ulong nb10,
         ulong nb11,
         ulong nb12,
         ulong nb13,
-        uint   ne0,
-        uint   ne1,
-        uint   ne2,
-        uint   ne3,
+        uint  ne0,
         ulong nb0,
         ulong nb1,
         ulong nb2,
@@ -751,21 +772,28 @@ kernel void kernel_add_row(
     dst[gid] = src0[gid] + src1[idx1];
 }
 
-REQD_SUBGROUP_SIZE_16
+// f16 flat/row: half8 like float8 path; arithmetic via add_f16_8 / mul_f16_8
 kernel void kernel_add_flat_f16(
-        global half16 * src0,
-        global half16 * src1,
-        global half16 * dst,
+        global half8 * src0,
+        global half8 * src1,
+        global half8 * dst,
         uint ne
 ) {
     uint gid = get_global_id(0);
-if(ne%get_max_sub_group_size()==0){
-    gid = sub_group_broadcast(gid,0);
-    half16 a = as_half16(intel_sub_group_block_read8((global uint*)(src0+gid)))
-             + as_half16(intel_sub_group_block_read8((global uint*)(src1+gid)));
-    intel_sub_group_block_write8((global uint*)(dst+gid), as_uint8(a));
-} else 
-    dst[gid] = src0[gid] + src1[gid];
+    if (gid < ne) {
+        dst[gid] = add_f16_8(src0[gid], src1[gid]);
+    }
+}
+
+kernel void kernel_add_row_f16(
+        global half8 * src0,
+        global half8 * src1,
+        global half8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    uint idx1 = gid % ne;
+    dst[gid] = add_f16_8(src0[gid], src1[idx1]);
 }
 
 //------------------------------------------------------------------------------
@@ -778,10 +806,6 @@ kernel void kernel_mul(
         ulong offset1,
         global char * dst,
         ulong offsetd,
-        uint ne00,
-        uint ne01,
-        uint ne02,
-        uint ne03,
         ulong nb00,
         ulong nb01,
         ulong nb02,
@@ -795,9 +819,6 @@ kernel void kernel_mul(
         ulong nb12,
         ulong nb13,
         uint ne0,
-        uint ne1,
-        uint ne2,
-        uint ne3,
         ulong nb0,
         ulong nb1,
         ulong nb2,
@@ -897,10 +918,6 @@ kernel void kernel_sub(
         ulong offset1,
         global char * dst,
         ulong offsetd,
-        uint ne00,
-        uint ne01,
-        uint ne02,
-        uint ne03,
         ulong nb00,
         ulong nb01,
         ulong nb02,
@@ -914,9 +931,6 @@ kernel void kernel_sub(
         ulong nb12,
         ulong nb13,
         uint ne0,
-        uint ne1,
-        uint ne2,
-        uint ne3,
         ulong nb0,
         ulong nb1,
         ulong nb2,
@@ -943,8 +957,6 @@ kernel void kernel_sub(
         float b = *((global float *)(src1_ptr + i10*nb10));
         *((global float *)(dst_ptr + i0*nb0)) = a - b;
     }
-    (void) ne00; (void) ne01; (void) ne02; (void) ne03;
-    (void) ne1; (void) ne2; (void) ne3;
 }
 
 // CONCAT. Одна нить — одна строка выхода. dim 0: хвост строки из src1. Иначе строка целиком из src0 или src1.
@@ -1027,6 +1039,348 @@ kernel void kernel_mul_row(
     dst[gid] = src0[gid] * src1[idx1];
 }
 
+kernel void kernel_mul_flat_f16(
+        global half8 * src0,
+        global half8 * src1,
+        global half8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    if (gid < ne) {
+        dst[gid] = mul_f16_8(src0[gid], src1[gid]);
+    }
+}
+
+kernel void kernel_mul_row_f16(
+        global half8 * src0,
+        global half8 * src1,
+        global half8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    uint idx1 = gid % ne;
+    dst[gid] = mul_f16_8(src0[gid], src1[idx1]);
+}
+
+// general-purpose f16 add — strides/broadcast; mul/add via f32 fma + RTE
+kernel void kernel_add_f16(
+        global char * src0,
+        global char * src1,
+        global char * dst,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint  ne10,
+        uint  ne11,
+        uint  ne12,
+        uint  ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint  ne0,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        ulong off0,
+        ulong off1,
+        ulong offd
+) {
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + off0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + off1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + offd + i03*nb3  + i02*nb2  + i01*nb1;
+
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const uint i10 = i0 % ne10;
+        half a = *((global half *)(src0_ptr + i0*nb00));
+        half b = *((global half *)(src1_ptr + i10*nb10));
+        *((global half *)(dst_ptr + i0*nb0)) = add_f16(a, b);
+    }
+}
+
+kernel void kernel_mul_f16(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint ne10,
+        uint ne11,
+        uint ne12,
+        uint ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint ne0,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst + offsetd;
+
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        half a = *((global half *)(src0_ptr + i0*nb00));
+        half b = *((global half *)(src1_ptr + i10*nb10));
+        *((global half *)(dst_ptr + i0*nb0)) = mul_f16(a, b);
+    }
+}
+
+
+// general-purpose bf16 add/mul — f32 fma + convert_f32_to_bf16
+kernel void kernel_add_bf16(
+        global char * src0,
+        global char * src1,
+        global char * dst,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint  ne10,
+        uint  ne11,
+        uint  ne12,
+        uint  ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint  ne0,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3,
+        ulong off0,
+        ulong off1,
+        ulong offd
+) {
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + off0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + off1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + offd + i03*nb3  + i02*nb2  + i01*nb1;
+
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const uint i10 = i0 % ne10;
+        ushort a = *((global ushort *)(src0_ptr + i0*nb00));
+        ushort b = *((global ushort *)(src1_ptr + i10*nb10));
+        *((global ushort *)(dst_ptr + i0*nb0)) = add_bf16(a, b);
+    }
+}
+
+kernel void kernel_mul_bf16(
+        global char * src0,
+        ulong offset0,
+        global char * src1,
+        ulong offset1,
+        global char * dst,
+        ulong offsetd,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        uint ne10,
+        uint ne11,
+        uint ne12,
+        uint ne13,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13,
+        uint ne0,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst + offsetd;
+
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+
+    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        ushort a = *((global ushort *)(src0_ptr + i0*nb00));
+        ushort b = *((global ushort *)(src1_ptr + i10*nb10));
+        *((global ushort *)(dst_ptr + i0*nb0)) = mul_bf16(a, b);
+    }
+}
+
+kernel void kernel_add_flat_bf16(
+        global ushort8 * src0,
+        global ushort8 * src1,
+        global ushort8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    if (gid < ne) {
+        ushort8 u = src0[gid], v = src1[gid];
+        ushort8 r;
+        r.s0 = add_bf16(u.s0, v.s0); r.s1 = add_bf16(u.s1, v.s1);
+        r.s2 = add_bf16(u.s2, v.s2); r.s3 = add_bf16(u.s3, v.s3);
+        r.s4 = add_bf16(u.s4, v.s4); r.s5 = add_bf16(u.s5, v.s5);
+        r.s6 = add_bf16(u.s6, v.s6); r.s7 = add_bf16(u.s7, v.s7);
+        dst[gid] = r;
+    }
+}
+
+kernel void kernel_add_row_bf16(
+        global ushort8 * src0,
+        global ushort8 * src1,
+        global ushort8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    uint idx1 = gid % ne;
+    ushort8 u = src0[gid], v = src1[idx1];
+    ushort8 r;
+    r.s0 = add_bf16(u.s0, v.s0); r.s1 = add_bf16(u.s1, v.s1);
+    r.s2 = add_bf16(u.s2, v.s2); r.s3 = add_bf16(u.s3, v.s3);
+    r.s4 = add_bf16(u.s4, v.s4); r.s5 = add_bf16(u.s5, v.s5);
+    r.s6 = add_bf16(u.s6, v.s6); r.s7 = add_bf16(u.s7, v.s7);
+    dst[gid] = r;
+}
+
+kernel void kernel_mul_flat_bf16(
+        global ushort8 * src0,
+        global ushort8 * src1,
+        global ushort8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    if (gid < ne) {
+        ushort8 u = src0[gid], v = src1[gid];
+        ushort8 r;
+        r.s0 = mul_bf16(u.s0, v.s0); r.s1 = mul_bf16(u.s1, v.s1);
+        r.s2 = mul_bf16(u.s2, v.s2); r.s3 = mul_bf16(u.s3, v.s3);
+        r.s4 = mul_bf16(u.s4, v.s4); r.s5 = mul_bf16(u.s5, v.s5);
+        r.s6 = mul_bf16(u.s6, v.s6); r.s7 = mul_bf16(u.s7, v.s7);
+        dst[gid] = r;
+    }
+}
+
+kernel void kernel_mul_row_bf16(
+        global ushort8 * src0,
+        global ushort8 * src1,
+        global ushort8 * dst,
+        uint ne
+) {
+    uint gid = get_global_id(0);
+    uint idx1 = gid % ne;
+    ushort8 u = src0[gid], v = src1[idx1];
+    ushort8 r;
+    r.s0 = mul_bf16(u.s0, v.s0); r.s1 = mul_bf16(u.s1, v.s1);
+    r.s2 = mul_bf16(u.s2, v.s2); r.s3 = mul_bf16(u.s3, v.s3);
+    r.s4 = mul_bf16(u.s4, v.s4); r.s5 = mul_bf16(u.s5, v.s5);
+    r.s6 = mul_bf16(u.s6, v.s6); r.s7 = mul_bf16(u.s7, v.s7);
+    dst[gid] = r;
+}
+
+
+// mixed bf16 × f32 → bf16 (weights often f32 in RMS_NORM_MUL_ADD)
+kernel void kernel_add_bf16_f32(
+        global char * src0,  // bf16
+        global char * src1,  // f32
+        global char * dst,   // bf16
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        uint  ne10, uint ne11, uint ne12, uint ne13,
+        ulong nb10, ulong nb11, ulong nb12, ulong nb13,
+        uint  ne0,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3,
+        ulong off0, ulong off1, ulong offd
+) {
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+    global char * src0_ptr = src0 + off0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + off1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + offd + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const uint i10 = i0 % ne10;
+        float a = convert_bf16_to_f32(*((global ushort *)(src0_ptr + i0*nb00)));
+        float b = *((global float *)(src1_ptr + i10*nb10));
+        *((global ushort *)(dst_ptr + i0*nb0)) = convert_f32_to_bf16(fma(a, 1.f, b));
+    }
+}
+
+kernel void kernel_mul_bf16_f32(
+        global char * src0, ulong offset0,  // bf16
+        global char * src1, ulong offset1,  // f32
+        global char * dst,  ulong offsetd,  // bf16
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        uint ne10, uint ne11, uint ne12, uint ne13,
+        ulong nb10, ulong nb11, ulong nb12, ulong nb13,
+        uint ne0,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst + offsetd;
+    uint i03 = get_group_id(2);
+    uint i02 = get_group_id(1);
+    uint i01 = get_group_id(0);
+    uint i13 = i03 % ne13;
+    uint i12 = i02 % ne12;
+    uint i11 = i01 % ne11;
+    global char * src0_ptr = src0 + i03*nb03 + i02*nb02 + i01*nb01;
+    global char * src1_ptr = src1 + i13*nb13 + i12*nb12 + i11*nb11;
+    global char * dst_ptr  = dst  + i03*nb3  + i02*nb2  + i01*nb1;
+    for (uint i0 = get_local_id(0); i0 < ne0; i0 += get_local_size(0)) {
+        const int i10 = i0 % ne10;
+        float a = convert_bf16_to_f32(*((global ushort *)(src0_ptr + i0*nb00)));
+        float b = *((global float *)(src1_ptr + i10*nb10));
+        *((global ushort *)(dst_ptr + i0*nb0)) = convert_f32_to_bf16(fma(a, b, 0.f));
+    }
+}
+
 //------------------------------------------------------------------------------
 // scale
 //------------------------------------------------------------------------------
@@ -1063,6 +1417,43 @@ kernel void kernel_scale_strided(
     uint i3 = t / n2;
     float x = *(global float *)(src + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
     *(global float *)(dst + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3) = x * scale + bias;
+    (void) ne3;
+}
+
+// bf16 SCALE: not float8 — 2-byte elems. f32 fma + convert_f32_to_bf16.
+kernel void kernel_scale_bf16(
+        global ushort * src0,
+        global ushort * dst,
+        float scale,
+        float bias
+) {
+    uint gid = get_global_id(0);
+    float x = convert_bf16_to_f32(src0[gid]);
+    dst[gid] = convert_f32_to_bf16(fma(x, scale, bias));
+}
+
+kernel void kernel_scale_bf16_strided(
+        global char * src,
+        global char * dst,
+        float scale,
+        float bias,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3
+) {
+    uint i = get_global_id(0);
+    uint n0 = ne0 > 0 ? (uint) ne0 : 1;
+    uint n1 = ne1 > 0 ? (uint) ne1 : 1;
+    uint n2 = ne2 > 0 ? (uint) ne2 : 1;
+    uint i0 = i % n0;
+    uint t  = i / n0;
+    uint i1 = t % n1;
+    t /= n1;
+    uint i2 = t % n2;
+    uint i3 = t / n2;
+    ushort u = *(global ushort *)(src + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+    float x = convert_bf16_to_f32(u);
+    *(global ushort *)(dst + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3) = convert_f32_to_bf16(fma(x, scale, bias));
     (void) ne3;
 }
 
@@ -1183,6 +1574,101 @@ kernel void kernel_ssm_conv(
         sum += s[i0] * c[i0];
     }
     *(global float *)(dst + offd + (ulong) i1 * nb0 + (ulong) i2 * nb1 + (ulong) i3 * nb2) = sum;
+}
+
+// SSM_SCAN. Mamba-1/2 selective scan (f32). Нить: (dim i1, head h, seq).
+// Как CPU: softplus(dt); state = state*exp(dt*A) + B*(x*dt); y = dot(state,C).
+// dst = [y | state(+snapshots)]; s_off — байты до блока состояния.
+#define SSM_SCAN_MAX_N 256
+kernel void kernel_ssm_scan(
+        global char * src0, ulong off0,   // s
+        global char * src1, ulong off1,   // x
+        global char * src2, ulong off2,   // dt
+        global char * src3, ulong off3,   // A
+        global char * src4, ulong off4,   // B
+        global char * src5, ulong off5,   // C
+        global char * src6, ulong off6,   // ids i32
+        global char * dst,  ulong offd,
+        int nc, int nr, int nh, int ng, int nt, int ns, int K,
+        int a_scalar,
+        ulong s0_nb2, ulong s0_nb3,
+        ulong x_nb2,  ulong x_nb3,
+        ulong dt_nb1, ulong dt_nb2,
+        ulong A_nb1,
+        ulong B_nb2,  ulong B_nb3,
+        ulong C_nb2,  ulong C_nb3,
+        ulong s_off
+) {
+    int i1 = (int) get_global_id(0);
+    int h  = (int) get_global_id(1);
+    int i3 = (int) get_global_id(2);
+    if (i1 >= nr || h >= nh || i3 >= ns || nc <= 0 || nc > SSM_SCAN_MAX_N) {
+        return;
+    }
+
+    global const int * ids = (global const int *)(src6 + off6);
+    const int id = ids[i3];
+    const int g = h / (nh / ng);
+    const int ii = i1 + h * nr;
+
+    global const float * s0_base = (global const float *)(src0 + off0 + (ulong) id * s0_nb3);
+    global float * s_out = (global float *)(dst + offd + s_off + (ulong) i3 * s0_nb3);
+    global float * y_base = (global float *)(dst + offd);
+
+    float state[SSM_SCAN_MAX_N];
+    for (int i0 = 0; i0 < nc; ++i0) {
+        state[i0] = s0_base[i0 + ii * nc];
+    }
+
+    for (int i2 = 0; i2 < nt; ++i2) {
+        global const float * x  = (global const float *)(src1 + off1 + (ulong) i2 * x_nb2  + (ulong) i3 * x_nb3);
+        global const float * dt = (global const float *)(src2 + off2 + (ulong) i2 * dt_nb1 + (ulong) i3 * dt_nb2);
+        global const float * A  = (global const float *)(src3 + off3);
+        global const float * B  = (global const float *)(src4 + off4 + (ulong) i2 * B_nb2  + (ulong) i3 * B_nb3);
+        global const float * C  = (global const float *)(src5 + off5 + (ulong) i2 * C_nb2  + (ulong) i3 * C_nb3);
+        global float * y = y_base + i2 * (nh * nr) + i3 * (nt * nh * nr);
+
+        float dt_sp = dt[h];
+        if (dt_sp <= 20.f) {
+            dt_sp = log(1.f + exp(dt_sp));
+        }
+        const float x_dt = x[ii] * dt_sp;
+        float sumf = 0.f;
+
+        if (a_scalar) {
+            const float dA = exp(dt_sp * A[h]);
+            for (int i0 = 0; i0 < nc; ++i0) {
+                const int ig = i0 + g * nc;
+                const float st = state[i0] * dA + B[ig] * x_dt;
+                sumf += st * C[ig];
+                state[i0] = st;
+            }
+        } else {
+            global const float * Ah = (global const float *)((global char *)A + (ulong) h * A_nb1);
+            for (int i0 = 0; i0 < nc; ++i0) {
+                const int ig = i0 + g * nc;
+                const float st = state[i0] * exp(dt_sp * Ah[i0]) + B[ig] * x_dt;
+                sumf += st * C[ig];
+                state[i0] = st;
+            }
+        }
+        y[ii] = sumf;
+
+        if (K > 1) {
+            const int slot = nt - 1 - i2;
+            if (slot > 0 && slot < K) {
+                global float * snap = (global float *)(dst + offd + s_off + (ulong)(slot * ns + i3) * s0_nb3);
+                for (int i0 = 0; i0 < nc; ++i0) {
+                    snap[i0 + ii * nc] = state[i0];
+                }
+            }
+        }
+    }
+
+    for (int i0 = 0; i0 < nc; ++i0) {
+        s_out[i0 + ii * nc] = state[i0];
+    }
+    (void) s0_nb2;
 }
 
 // ARGSORT. Bitonic по строке: src0 f32 → dst i32 (индексы). ne00_pad = 2^ceil(log2(ne00)).
@@ -1415,6 +1901,11 @@ inline half softplus_f16(half xh) {
     float x = xh;
     return convert_half_rte((x > 20.f) ? x : log(1.f + exp(x)));
 }
+// bf16: same threshold-20 softplus in f32, store convert_f32_to_bf16
+inline ushort softplus_bf16(ushort u) {
+    float x = convert_bf16_to_f32(u);
+    return convert_f32_to_bf16((x > 20.f) ? x : log(1.f + exp(x)));
+}
 
 inline half sgn_f16(half x){ return sign(x); }
 inline half neg_f16(half x){ return -x; }
@@ -1546,6 +2037,8 @@ KERNEL_UNARY(sigmoid_f16, half);
 KERNEL_UNARY(hardsigmoid_f16, half);
 KERNEL_UNARY(hardswish_f16, half);
 KERNEL_UNARY(softplus_f16, half);
+KERNEL_UNARY(softplus_bf16, ushort);
+KERNEL_UNARY_STRIDED(softplus_bf16, ushort);
 KERNEL_UNARY(sgn_f16, half);
 KERNEL_UNARY(neg_f16, half);
 KERNEL_UNARY(step_f16, half);
@@ -2110,7 +2603,7 @@ kernel void kernel_rms_norm(
     float sumf = 0.f;
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
         float xi = x[i];
-        sumf += xi * xi;
+        sumf = fma(xi, xi, sumf);
     }
     sumf = sub_group_reduce_add(sumf);
     if (get_sub_group_local_id() == 0) {
@@ -2131,13 +2624,13 @@ kernel void kernel_rms_norm(
     float scale = rsqrt(stripe[0] / (float) ne00 + eps);
     global float * y = (global float *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
-        y[i] = x[i] * scale;
+        y[i] = fma(x[i], scale, 0.f);
     }
 }
 //------------------------------------------------------------------------------
-// l2_norm — как rms_norm, но scale = 1/sqrt(sum + eps), без /ne00
+// rms_norm f16 / bf16 — sum/scale in f32; store via convert_* (native half NaNs on B60)
 //------------------------------------------------------------------------------
-kernel void kernel_l2_norm(
+kernel void kernel_rms_norm_f16(
         global char * src0, ulong off0,
         global char * dst,  ulong offd,
         uint ne00,
@@ -2154,10 +2647,104 @@ kernel void kernel_l2_norm(
     uint i03 = r0 / span;
     uint i02 = (r0 - i03 * span) / ne01;
     uint i01 = r0 - i03 * span - i02 * ne01;
-    global float * x = (global float *) (src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    global half * x = (global half *) (src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
     float sumf = 0.f;
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
-        float xi = x[i];
+        float xi = (float) x[i];
+        sumf = fma(xi, xi, sumf);
+    }
+    sumf = sub_group_reduce_add(sumf);
+    if (get_sub_group_local_id() == 0) {
+        stripe[get_sub_group_id()] = sumf;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float s = 0.f;
+        uint n = get_num_sub_groups();
+        for (uint k = 0; k < n; ++k) {
+            s += stripe[k];
+        }
+        stripe[0] = s;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    float scale = rsqrt(stripe[0] / (float) ne00 + eps);
+    global half * y = (global half *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = (float) x[i];
+        y[i] = convert_half_rte(fma(xi, scale, 0.f));
+    }
+}
+
+kernel void kernel_rms_norm_bf16(
+        global char * src0, ulong off0,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        ulong nb01, ulong nb02, ulong nb03,
+        ulong nb1, ulong nb2, ulong nb3,
+        float eps,
+        local float * stripe
+){
+    uint lid = get_local_id(0);
+    uint r0  = get_group_id(0);
+    uint span = ne02 * ne01;
+    uint i03 = r0 / span;
+    uint i02 = (r0 - i03 * span) / ne01;
+    uint i01 = r0 - i03 * span - i02 * ne01;
+    global ushort * x = (global ushort *) (src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03);
+    float sumf = 0.f;
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = convert_bf16_to_f32(x[i]);
+        sumf = fma(xi, xi, sumf);
+    }
+    sumf = sub_group_reduce_add(sumf);
+    if (get_sub_group_local_id() == 0) {
+        stripe[get_sub_group_id()] = sumf;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float s = 0.f;
+        uint n = get_num_sub_groups();
+        for (uint k = 0; k < n; ++k) {
+            s += stripe[k];
+        }
+        stripe[0] = s;
+    }
+    work_group_barrier(CLK_LOCAL_MEM_FENCE);
+    float scale = rsqrt(stripe[0] / (float) ne00 + eps);
+    global ushort * y = (global ushort *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = convert_bf16_to_f32(x[i]);
+        y[i] = convert_f32_to_bf16(fma(xi, scale, 0.f));
+    }
+}
+
+//------------------------------------------------------------------------------
+// l2_norm — CPU: scale = 1/max(sqrt(sum), eps); strides nb00/nb0 (views + permute)
+//------------------------------------------------------------------------------
+kernel void kernel_l2_norm(
+        global char * src0, ulong off0,
+        global char * dst,  ulong offd,
+        uint ne00,
+        uint ne01,
+        uint ne02,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        ulong nb0,  ulong nb1,  ulong nb2,  ulong nb3,
+        float eps,
+        local float * stripe
+){
+    uint lid = get_local_id(0);
+    uint r0  = get_group_id(0);
+    uint span = ne02 * ne01;
+    uint i03 = r0 / span;
+    uint i02 = (r0 - i03 * span) / ne01;
+    uint i01 = r0 - i03 * span - i02 * ne01;
+    global char * xrow = src0 + off0 + (ulong) i01 * nb01 + (ulong) i02 * nb02 + (ulong) i03 * nb03;
+    global char * yrow = dst  + offd + (ulong) i01 * nb1  + (ulong) i02 * nb2  + (ulong) i03 * nb3;
+    float sumf = 0.f;
+    for (uint i = lid; i < ne00; i += get_local_size(0)) {
+        float xi = *(global float *)(xrow + (ulong) i * nb00);
         sumf += xi * xi;
     }
     sumf = sub_group_reduce_add(sumf);
@@ -2176,10 +2763,10 @@ kernel void kernel_l2_norm(
     } else {
     }
     work_group_barrier(CLK_LOCAL_MEM_FENCE);
-    float scale = rsqrt(stripe[0] + eps);
-    global float * y = (global float *) (dst + offd + (ulong) i01 * nb1 + (ulong) i02 * nb2 + (ulong) i03 * nb3);
+    float scale = 1.f / fmax(sqrt(stripe[0]), eps);
     for (uint i = lid; i < ne00; i += get_local_size(0)) {
-        y[i] = x[i] * scale;
+        float xi = *(global float *)(xrow + (ulong) i * nb00);
+        *(global float *)(yrow + (ulong) i * nb0) = xi * scale;
     }
 }
 // Объединяет операцию rms_norm  c пост-операцией mul, нормуль. Операция mul с броадкастом, с повтором строки 
@@ -3603,8 +4190,9 @@ kernel void kernel_cpy_f32_f16(
         + i03*nb3 + i02*nb2 + i01*nb1 + i00*nb0) = convert_half_rte(v);
 }
 #if defined(cl_intel_bfloat16_conversions)
+// bf16 bits are not IEEE half — never load as half (that yields Inf/NaN).
 kernel void kernel_cpy_bf16_f32(
-        global half * src0,
+        global ushort * src0,
         ulong offset0,
         global float * dst,
         ulong offsetd,
@@ -3625,9 +4213,8 @@ kernel void kernel_cpy_bf16_f32(
         ulong nb2,
         ulong nb3
 ) {
-
-    src0 = (global half*)((global char*)src0 + offset0);
-    dst = (global float*)((global char*)dst + offsetd);
+    src0 = (global ushort *)((global char *)src0 + offset0);
+    dst  = (global float  *)((global char *)dst  + offsetd);
 
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
@@ -3640,19 +4227,11 @@ kernel void kernel_cpy_bf16_f32(
     int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
     int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
 
-    global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-/*    if (nb00==sizeof(ushort) && ne00%16==0){// выделить в отдельную функцию
-        global ushort* src_data = (global ushort*)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01);
-        for (uint i = get_local_id(0); i < ne00/16; i += get_local_size(0)) {
-            ushort16 tmp = vload16(i, src_data);
-            vstore16(intel_convert_as_bfloat1616_float16(tmp), i, dst_data);
-        }
-    } else */
-        src0 = (global half*)((global char*)src0 + i03*nb03 + i02*nb02 + i01*nb01);
-        uint stride = nb00/2;
-        for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
-            dst_data[i] = convert_bf16_to_f32(src0[i*stride]);
-        }
+    global float * dst_data = (global float *)((global char *)dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
+        ushort u = *(global const ushort *)((global char *)src0 + i03*nb03 + i02*nb02 + i01*nb01 + (ulong)i*nb00);
+        dst_data[i] = convert_bf16_to_f32(u);
+    }
 }
 kernel void kernel_cpy_f32_bf16(
         global float * src0,
@@ -3676,8 +4255,8 @@ kernel void kernel_cpy_f32_bf16(
         ulong nb2,
         ulong nb3
 ) {
-    src0 = (global float*)((global char*)src0 + offset0);
-    dst = (global half*)((global char*)dst + offsetd);
+    src0 = (global float  *)((global char *)src0 + offset0);
+    dst  = (global ushort *)((global char *)dst  + offsetd);
 
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
@@ -3690,29 +4269,94 @@ kernel void kernel_cpy_f32_bf16(
     int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
     int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
 
-    global ushort * dst_data = (global ushort *)((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-/*
-if (nb00==sizeof(float) && ne00%16==0){// выделить в отдельную функцию
-    global float* src_data = (global float*)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01);
-    if (get_local_size(0)%get_max_sub_group_size()==0) {// работает!
-        for (uint i = sub_group_broadcast(get_local_id(0),0); i < ne00/8; i += get_local_size(0)) {
-            const float8 t0 = as_float8(intel_sub_group_block_read8((global uint*)(src_data+i*8)));
-            intel_sub_group_block_write_us8((global ushort*)dst_data+i*8, intel_convert_bfloat168_as_ushort8(t0));
-        }
-    } else 
-        for (uint i = get_local_id(0); i < ne00/16; i += get_local_size(0)) {
-            float16 tmp = vload16(i, src_data);
-    #if defined(cl_intel_subgroup_matrix_multiply_accumulate)// можно по два значения сохранять
-            vstore16(intel_convert_f32_to_bf16(tmp), i, (global short *)dst_data);
-    #else
-            vstore16(intel_convert_bfloat1616_as_ushort16(tmp), i, dst_data);
-    #endif
-        }
-} else */
-    src0 = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01);
-    uint stride = nb00/4;
-    for (uint i = get_local_id(0); i < ne00; i += get_local_size(0)) {
-        dst_data[i] = convert_f32_to_bf16(src0[i*stride]);//convert_f32_to_bf16_rtn
+    global ushort * dst_data = (global ushort *)((global char *)dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    for (uint i = get_local_id(0); i < (uint)ne00; i += get_local_size(0)) {
+        float v = *(global const float *)((global char *)src0 + i03*nb03 + i02*nb02 + i01*nb01 + (ulong)i*nb00);
+        dst_data[i] = convert_f32_to_bf16(v);
+    }
+}
+kernel void kernel_cpy_f16_bf16(
+        global half * src0,
+        ulong offset0,
+        global ushort * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global half   *)((global char *)src0 + offset0);
+    dst  = (global ushort *)((global char *)dst  + offsetd);
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0);
+
+    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
+
+    int i3 = n / (ne2*ne1*ne0);
+    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
+    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
+    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
+
+    global ushort * dst_data = (global ushort *)((global char *)dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
+        half h = *(global const half *)((global char *)src0 + i03*nb03 + i02*nb02 + i01*nb01 + (ulong)i*nb00);
+        dst_data[i] = convert_f32_to_bf16(convert_float(h));
+    }
+}
+kernel void kernel_cpy_bf16_f16(
+        global ushort * src0,
+        ulong offset0,
+        global half * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global ushort *)((global char *)src0 + offset0);
+    dst  = (global half   *)((global char *)dst  + offsetd);
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0);
+
+    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
+
+    int i3 = n / (ne2*ne1*ne0);
+    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
+    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
+    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
+
+    global half * dst_data = (global half *)((global char *)dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    for (int i = get_local_id(0); i < ne00; i += get_local_size(0)) {
+        ushort u = *(global const ushort *)((global char *)src0 + i03*nb03 + i02*nb02 + i01*nb01 + (ulong)i*nb00);
+        dst_data[i] = convert_half_rte(convert_bf16_to_f32(u));
     }
 }
 #endif
@@ -3818,6 +4462,119 @@ if (nb00==sizeof(float) && ne00%get_max_sub_group_size()==0){// выделить
         *(global float *)((global char *) dst_data + (ulong) i * nb0) =
             *(global float *)((global char *) src_data + (ulong) i * nb00);
     }
+}
+
+
+// CPY → Q8_0. Один блок = 32 значения. d = amax/127, qs = round-nearest-even
+// (как AVX _MM_ROUND_NEAREST), затем насыщение в int8. dst — плотные блоки.
+inline void quant_f32_block_q8_0(float x[QK8_0], global struct block_q8_0 * y) {
+    // AVX quantize_row_q8_0: vdivss max/127, id=127/max, vrndscaleps $0, packsswb.
+    float amax = 0.f;
+    for (int j = 0; j < QK8_0; ++j) {
+        amax = fmax(amax, fabs(x[j]));
+    }
+    const float d = amax / 127.f;
+    const float id = (amax != 0.f) ? (127.f / amax) : 0.f;
+    y->d = convert_half_rte(d);
+    for (int j = 0; j < QK8_0; ++j) {
+        y->qs[j] = convert_char_sat_rte(x[j] * id);
+    }
+}
+
+#define CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3) \
+    do { \
+        int _i = (b) * QK8_0; \
+        int _n0 = (ne0) > 0 ? (ne0) : 1; \
+        int _n1 = (ne1) > 0 ? (ne1) : 1; \
+        int _n2 = (ne2) > 0 ? (ne2) : 1; \
+        int _t = _i / _n0; \
+        (i0) = _i % _n0; \
+        (i1) = _t % _n1; \
+        _t /= _n1; \
+        (i2) = _t % _n2; \
+        (i3) = _t / _n2; \
+    } while (0)
+
+kernel void kernel_cpy_f32_q8_0(
+        global char * src, ulong off0,
+        global char * dst, ulong off1,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        int nblocks) {
+    int b = get_global_id(0);
+    if (b >= nblocks) return;
+    int i0, i1, i2, i3;
+    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
+    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
+    float x[QK8_0];
+    for (int j = 0; j < QK8_0; ++j) {
+        x[j] = *(global float *)(src + base + (ulong)j*nb00);
+    }
+    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
+    quant_f32_block_q8_0(x, y);
+    (void) ne3;
+}
+
+kernel void kernel_cpy_f16_q8_0(
+        global char * src, ulong off0,
+        global char * dst, ulong off1,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        int nblocks) {
+    int b = get_global_id(0);
+    if (b >= nblocks) return;
+    int i0, i1, i2, i3;
+    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
+    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
+    float x[QK8_0];
+    for (int j = 0; j < QK8_0; ++j) {
+        x[j] = *(global half *)(src + base + (ulong)j*nb00);
+    }
+    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
+    quant_f32_block_q8_0(x, y);
+    (void) ne3;
+}
+
+kernel void kernel_cpy_bf16_q8_0(
+        global char * src, ulong off0,
+        global char * dst, ulong off1,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        int nblocks) {
+    int b = get_global_id(0);
+    if (b >= nblocks) return;
+    int i0, i1, i2, i3;
+    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
+    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
+    float x[QK8_0];
+    for (int j = 0; j < QK8_0; ++j) {
+        ushort u = *(global ushort *)(src + base + (ulong)j*nb00);
+        x[j] = as_float((uint)u << 16);
+    }
+    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
+    quant_f32_block_q8_0(x, y);
+    (void) ne3;
+}
+
+kernel void kernel_cpy_q8_0_f32(
+        global char * src, ulong off0,
+        global char * dst, ulong off1,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3,
+        int nblocks) {
+    int b = get_global_id(0);
+    if (b >= nblocks) return;
+    int i0, i1, i2, i3;
+    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
+    ulong sbase = off0 + (ulong)(i0 / QK8_0)*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
+    global struct block_q8_0 * blk = (global struct block_q8_0 *)(src + sbase);
+    float d = convert_float(blk->d);
+    ulong dbase = off1 + (ulong)i0*nb0 + (ulong)i1*nb1 + (ulong)i2*nb2 + (ulong)i3*nb3;
+    for (int j = 0; j < QK8_0; ++j) {
+        *(global float *)(dst + dbase + (ulong)j*nb0) = (float)blk->qs[j] * d;
+    }
+    (void) ne3;
 }
 
 //------------------------------------------------------------------------------

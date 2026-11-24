@@ -63,18 +63,27 @@ Two GPUs → two processes, two ports (RPC) or two backends; one process owns on
 | `QNN_OCL_KIND` | `spirv` / `bin` to load from dump instead of source |
 | `QNN_OCL_DUMP` | directory for `.cl` / `.bin` dumps |
 | `GGML_OCL_BLOCK_LEDGER` | `1` — live block ledger on stderr |
+| `GGML_OPENCL_FINITE_MATH` | `1` (default) finite+fast+unsafe; `0` — strict, no those flags |
 
 ## What works (acceptance snapshot)
 
-Temperatures and seeds in `ChangeLog`. Headline:
+Device: Intel Arc Pro **B60**, RPC **10.0.1** when used. Temps/seeds and op matrices: [`ChangeLog`](ChangeLog).
 
-- **Q4_0 · Q4_K · Q6_K** on the acceptance path. Do **not** promise `Q5_0` / `Q5_1`.
-- KV cache native path: **f16** (flash attn heads up to 256 in `supports_op`; larger may arrive via RPC).
-- Device-side layout reshape for **Q4_0**; other types mostly host bytes as shipped.
-- Models spoken on Arc Pro B60: Qwen2.5-Coder-7B, Qwen3-8B-class, Gemma-3 / Gemma-4 family, MoE 26B-A4B after ARGSORT + MUL_MAT_ID.
-- Large native windows (e.g. 27B × 262k f16 KV) can exceed card VRAM — that is capacity, not a silent op gap.
+| model | quant | speech | note |
+|--|--|--|--|
+| tinyllama | Q4_K | **ok** | smoke 2026-11-24 |
+| Qwen2.5-Coder-7B-Instruct | Q4_0 | **ok** | |
+| Gemma-4 E4B | Q4_0 | **ok** | |
+| Gemma-4 26B-A4B (MoE) | Q4_0 | **ok** | ARGSORT + MUL_MAT_ID |
+| Qwen3 / Qwen3.8-class | Q4_K / Q8 | **ok** | older ChangeLog rows |
+| Qwen3.5-27B (hybrid) | Q6_K | **fail** | graph runs; `<think>` / `<|im_end|>` loop — see ChangeLog 2026-11-24 |
 
-Details and op matrices: [`ChangeLog`](ChangeLog).
+Headline limits:
+
+- Quants on the gate: **Q4_0 · Q4_K · Q6_K**. Do **not** promise `Q5_0` / `Q5_1`.
+- KV native: **f16**. Flash heads in `supports_op` up to 256 (512 may arrive via RPC).
+- Ops matrix (see `docs/OPS_LADDER.CONTRACT.md`): **RMS** · **SSM** (incl. `SSM_SCAN`) · `SOFTPLUS` · CPY bf16 · Mamba-130m F16 smoke — ok. Hybrid thesis: layer on CPU if CPU pulls; CPU BF16/FP16 only with `AVX*BF16`/`AVX*FP16`; CPU matrix → Nova Lake. **Next: Qwen3.5-27B speech.**
+- Large native windows (e.g. 27B × 262k f16 KV) can exceed card VRAM — capacity, not a silent op gap.
 
 ## Tree
 
@@ -83,7 +92,7 @@ Details and op matrices: [`ChangeLog`](ChangeLog).
 | `src/` | Backend dispatcher (`ggml-opencl.cpp` + cmake) |
 | `kernels/` | OpenCL C — temporary LL until QNN ICD |
 | `ir/` | Tensor IR sketch + host/OpenCL LL smoke (`mcp_ir_*`) |
-| `docs/` | IR / milestone notes |
+| `docs/` | IR / milestone notes; **ops ladder contract** `OPS_LADDER.CONTRACT.md` |
 | `tools/quantize/` | Pointer to FP8 / type tooling (lives outside this repo) |
 | `ChangeLog` | What landed and what was measured |
 
