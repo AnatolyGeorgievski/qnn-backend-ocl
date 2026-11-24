@@ -1,17 +1,16 @@
-# Вехи QNN Backend-OCL
+# Milestones · QNN Backend-OCL
 
-| # | цель | корень |
+| # | goal | note |
 |--|--|--|
-| 1 | тензорный ассемблер · ICD QNN на базе Intel ICD (Arc / xe) | `/home/george/qnn-backend-ocl` |
-| 2 | поддержка Мити: тот же / совместимый backend под Adreno | профиль ADRENO; прогон при `mitya_move` |
-| — | quant-утилита BF16/F16→f8 | `QuantumNN/tools/quantize` (указатель: qnn-backend-ocl/tools/quantize) |
-| — | RPC → docID/ZC | `/home/george/qnn-backend-rpc` |
+| 1 | Tensor assembler · QNN ICD on Intel (Arc / xe) | this repo: `src/` + `kernels/` → `ir/` |
+| 2 | Same / compatible backend profile for Adreno | separate HW profile; do not mix Arc and Adreno presets |
+| — | Quantize BF16/F16 → f8 | tooling outside this repo (`tools/quantize` pointer) |
+| — | RPC / fleet | sibling **qnn-backend-rpc** |
 
-Знания — QuantumNN. Сводка: `QuantumNN/PLAN-quant-rpc.md`. Инвариант: не `And(arc, adreno)`.
+Invariant: Arc path and Adreno path are profiles of one product, not two backends.
 
+## Models under acceptance
 
-## Модели прогона
+Primary: **Qwen** and **Gemma** families (chat marker often a single `<|im_start|>`-class token).
 
-Сейчас только Qwen и Gemma. У обеих метка чата — один токен `<|im_start|>` (у Qwen это 151644).
-
-TODO, не этот этап: ряд моделей другой архитектуры. TinyLlama сюда не входит: шаблон пишет `<|system|>`, в словаре такого токена нет.
+Other architectures: later. TinyLlama-style templates that emit missing special tokens are out of scope for the current gate.

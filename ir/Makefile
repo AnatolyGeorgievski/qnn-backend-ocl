@@ -1,7 +1,7 @@
 # O0 host IR smoke — без ICD; ocl LL — тонкий OpenCL
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=c11
-QNN_INC ?= /home/george/QuantumNN
+QNN_INC ?= $(HOME)/QuantumNN
 CFLAGS += -I$(QNN_INC) -I.
 OPENCL_LIBS ?= -lOpenCL
 

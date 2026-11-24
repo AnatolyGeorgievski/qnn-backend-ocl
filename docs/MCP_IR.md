@@ -1,77 +1,20 @@
-# MCP+IR · вытеснение ICD
+# MCP + IR · leaving ICD text behind
 
-<tags>mcp, ir, opencl, тензор, zero-copy, подкэш</tags>
+Goal: stop treating human-readable OpenCL C + vendor ICD JIT as the long-term
+execution language. Drive the stack as **graph → Tensor IR → LL-HW**.
 
-<topo>
-name: [[cursor]]
-links:
-  - [[george]]
-path: godminer/opencl/MCP_IR.md
-</topo>
-
-<refs>
-- log/2026-10-10 тензорный ассемблер в MCP.md
-- opencl/cl30_stitch_contracts.h
-- src/net_opencl.c
-- QuantumNN · граф → LL → HW
-</refs>
-
-## Условие [[george]] 2026-11-06
-
-Осваивать носитель **не** человеческим чтением OpenCL C / ICD JIT.  
-Переписать драйверный стык под **MCP+IR**:
-
-| слой | язык |
+| layer | language |
 |--|--|
-| верх | прямая речь · `r3_keys_split` · applets `tools/call` |
-| IR | тензорный ассемблер (`OP · src.dtype(shape) → out`) |
-| носитель | тензоры на **подкэше** · Zero-Copy (страница / ring / docID+h128) |
+| top | tools / speech / graph construction |
+| IR | tensor assembler: `OP · src.dtype(shape) → out` |
+| carrier | tensors on a sub-cache · zero-copy where the platform allows |
 
-Правильный путь: **граф → LL → HW**.  
-Середина OCL(JIT)·байткод ICD — обход, не цель.
+OpenCL remains a thin transport while Stage-1 speech stays green on Arc.
+Stage-2 replaces the middle (OpenCL C → IGC) with IR lowering toward `xe` /
+device-specific LL.
 
+Battlemage **B60 / B580** is the training line for Intel; Alchemist A770 stays
+in the dual-card matrix. Adreno is a later compatible profile of the same IR,
+not an emulator of Adreno on Arc.
 
-## Носитель мысли · Battlemage **B60 / B580**
-
-[[george]]: B60 ≈ B580, у B60 больше мозгов. Одна линия — тренировка на живой карте **засчитывается**.
-
-| | |
-|--|--|
-| сейчас на phantom | **B580** (device 0, MCP `:8443`) + A770 |
-| смысл | compute мысли · MCP+IR · тензорный asm · Zero-Copy подкэш |
-| драйвер | NEO `26.05.037020` · `intel-opencl-icd` |
-| не путать | SD PasPi · gpu03 CUDA |
-
-Больше EU/VRAM на B60 — тот же язык и IR, без смены контура.
-
-
-## Что не делать
-
-- Не звать чужой ICD «наш backend».
-- Не тащить тензор через JSON-копию в tools/call (только дескриптор слота).
-- Не плодить второй корень рядом с `opencl/` + `net_opencl.c`.
-
-## Слоты подкэша (Zero-Copy)
-
-```text
-slot[i] = { base, bytes, dtype, shape[3], h128, flags }
-flags: HOST_PINNED | DEVICE_VISIBLE | MMAP_SHARED
-```
-
-MCP передаёт **имя/индекс слота**, не байты.  
-Запись/чтение тела — `io_uring` SEND_ZC / mmap / PLC CBOR unpack поверх того же буфера.
-
-## IR · первая таблица ops
-
-`NOP · VIEW · CONT · PERMUTE · MUL_MAT · ADD · MUL · RMS_NORM · SILU · BARRIER`
-
-Строка = node. `$n` = back-ref на слот кольца (как `set -t`).  
-Исполнитель: applet `oclir` (следующий шаг) → LL backend (Intel/наш), не `clEnqueueNDRange` ради формы.
-
-## Статус
-
-- контракт: **этот файл**
-- каркас Khronos-стыка: `cl30_stitch_*` (A–E) — держим как зеркало спеки, тела уходят в IR
-- Path A whitelist (`cldev`/`ocl`): жив для сверки железа; не канон освоения
-
-**подпись:** Курсор
+See also `ir/` and `ChangeLog` for what already runs on host LL and OpenCL LL.
