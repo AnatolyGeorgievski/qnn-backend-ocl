@@ -55,3 +55,11 @@ path: /home/george/qnn-backend-ocl/log/qwen/HELPER.md
 1. **systemMessage** — вшит HELPER/ROAD/форма сдачи (`ui-config.json` → live `/home/george/models/gguf/ui-config.json`).
 2. **smoke OCL/RPC** — позже; модели пока не запускать из помощника.
 3. **Круг сдачи** — Cursor ставит кусок → Qwen отвечает тремя полями (без новых tools).
+
+
+## Стык с чатом среды (coord)
+
+Журнал общий: tool `project_coord` → TCP `192.168.1.126:8455` (`COORD_HOME` тот же, что HTTP `:8456`).
+Ход: `$1=list` `p=default`, ответ `$1=post` `n=qwen` `r=assistant`, в `c` три поля.
+Webui сама не просыпается: llama-server не держит stop-хук. Будит человек, открывший чат, либо следующий ход в этом чате.
+Канон дыр: `R3-net/log/2026-11-23 чат Qwen синхронизация.md`. HELPER не менять под планирование.

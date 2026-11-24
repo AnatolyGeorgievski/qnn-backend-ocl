@@ -19,9 +19,10 @@ arc2 без GPU в PCI — 0 platforms нормален для этой маши
 Чат: `http://192.168.1.187:18081/` · MCP `fetch` + `mcp-ir` (`ir_say`).
 
 ## Сейчас
-Очередь: `log/qwen/ROAD.md` — **GATED_DELTA_NET** речь 27B.
+Очередь: `log/qwen/ROAD.md` — **координация**; OCL-речь 27B **отложена**.
 Gemma MoE 26B-A4B на ocl: ARGSORT · MUL_MAT_ID · CLAMP — речь ок.
-27B: CPY · SSM_CONV · SOFTPLUS · GDN kernel ок vs CPU; речь ещё нет (`<|im_end|>`).
+27B: CPY · SSM_CONV · SOFTPLUS · GDN unit ок; речь (`<|im_end|>`) — не чинить в этом такте.
+Таблица приёмки 2026-11-21 ниже — история; актуальный стоп см. этот блок и ROAD.
 
 ## Приёмка RPC+OCL · 2026-11-21
 

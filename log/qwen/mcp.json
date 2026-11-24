@@ -11,6 +11,14 @@
       "command": "/home/george/bin/mcp-ir",
       "args": [],
       "timeout_ms": 120000
+    },
+    "project": {
+      "command": "/usr/bin/nc",
+      "args": [
+        "192.168.1.126",
+        "8455"
+      ],
+      "timeout_ms": 120000
     }
   }
 }

@@ -15,15 +15,16 @@ links:
 path: /home/george/qnn-backend-ocl/log/qwen/ROAD.md
 </topo>
 
-Порядок (2026-11-22):
+Порядок (2026-11-23):
 
 1. ~~Агент-помощник~~ — контракт + ui-config (smoke моделей — позже).
 2. ~~ARGSORT~~ — bitonic `kernel_argsort_f32_i32`.
 3. ~~MUL_MAT_ID~~ — Q4_0 SOA `kernel_mul_mv_id_q4_0_f32_8x_flat` (+ фикс CLAMP workgroup).
-4. **GATED_DELTA_NET** — ядро OK vs CPU (43/43); речь 27B ещё нет (`<|im_end|>` / `<think>` loop).
+4. ~~GATED_DELTA_NET~~ kernel+host — unit 43/43 (`6caa8b9`); **речь 27B отложена** (hybrid состав, не unit).
+5. **Координация** — срез с [[nil]] / указатели; OCL-актив не вести в этом такте.
 
-Закрыто по пути 27B: CPY→view · SSM_CONV · SOFTPLUS (`21f0130`) · GDN kernel+host.
-Открыто: численная/составная поломка hybrid-пути на 27B (не сам GDN по unit).
+Закрыто по пути 27B до паузы: CPY→view · SSM_CONV · SOFTPLUS (`21f0130`) · GDN (`6caa8b9`).
+Отложено: численная/составная поломка hybrid-пути на 27B.
 Gemma на ocl: E4B · 12B · **26B-A4B Q4_0 ок** (Hello · 28.1 / 20.9 t/s).
 
 Модели под рукой:
