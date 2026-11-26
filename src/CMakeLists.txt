@@ -59,6 +59,7 @@ set(GGML_OPENCL_KERNELS
     ggml-opencl_mv
     ggml-opencl_mm
     ggml-opencl_cvt
+    ggml-opencl_q8
     ggml-opencl_gemv_noshuffle
     ggml-opencl_gemv_noshuffle_general
     ggml-opencl_mul_mat_Ab_Bi_8x4

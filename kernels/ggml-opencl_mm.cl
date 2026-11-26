@@ -1363,6 +1363,90 @@ kernel void kernel_mul_mv_q4_K_f32(
         dst[mad24(r1,ne0,row) + im*ne0*ne1] = sumf;
     }
 }
+
+// y уже в регистрах дорожки. 8 строк одного веса делят один столбец.
+inline float dot_block_q4_K_yl(global struct block_q4_K *x, float4 y0, float4 y1)
+{
+    const uint tid = get_sub_group_local_id();
+    const uint il  = tid/8;
+    const uint ir  = tid%8;
+    const uint q_offset = 32*il + 4*ir;
+
+    const half dall = x->d;
+    const half dmin = x->dmin;
+    uchar2 sc, m;
+    get_scale_min_k4_2(il, (global uchar2*)x->scales, &sc, &m);
+    const half2 d2 = dall * convert_half2(sc);
+    const half2 m2 = dmin * convert_half2(m);
+
+    uchar4 q = vload4(0, x->qs + q_offset);
+    uchar4 q0 = as_uchar4((as_uint(q)>>0)&0x0f0f0f0f);
+    uchar4 q1 = as_uchar4((as_uint(q)>>4)&0x0f0f0f0f);
+    float2 sums = (0.f);
+    sums.s0 += y0.s0 * (d2.s0*q0.s0 - m2.s0);
+    sums.s0 += y0.s1 * (d2.s0*q0.s1 - m2.s0);
+    sums.s0 += y0.s2 * (d2.s0*q0.s2 - m2.s0);
+    sums.s0 += y0.s3 * (d2.s0*q0.s3 - m2.s0);
+    sums.s1 += y1.s0 * (d2.s1*q1.s0 - m2.s1);
+    sums.s1 += y1.s1 * (d2.s1*q1.s1 - m2.s1);
+    sums.s1 += y1.s2 * (d2.s1*q1.s2 - m2.s1);
+    sums.s1 += y1.s3 * (d2.s1*q1.s3 - m2.s1);
+    return sums.s0 + sums.s1;
+}
+
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_32
+#elif defined (ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q4_K_f32_8x(
+        global void * src0,
+        global float * src1,
+        global float * dst,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne12,
+        int ne0,
+        int ne1
+) {
+    const int ndst = 8;
+    const int nb = ne00/QK_K;
+    const int r0 = get_group_id(0);
+    const int r1 = get_group_id(1);
+    const int first_row = r0 * ndst;
+    if (first_row >= ne01) {
+        return;
+    }
+
+    const uint tid = get_sub_group_local_id();
+    const uint il  = tid/8;
+    const uint ir  = tid%8;
+    const uint y_off = 64*il + 4*ir;
+
+    global struct block_q4_K * x = (global struct block_q4_K *) src0 + mul24(first_row, nb);
+    global float * yy = (global float *) src1 + mul24(r1, ne10);
+
+    float sumf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int i = 0; i < nb; i++) {
+        global float * y = yy + i * QK_K + y_off;
+        float4 y0 = vload4(0, y);
+        float4 y1 = vload4(0, y + 32);
+        for (int r = 0; r < ndst; r++) {
+            if (first_row + r < ne01) {
+                sumf[r] += dot_block_q4_K_yl(x + mul24(r, nb) + i, y0, y1);
+            }
+        }
+    }
+    for (int r = 0; r < ndst; r++) {
+        float tot = sub_group_reduce_add(sumf[r]);
+        if (get_sub_group_local_id() == 0 && first_row + r < ne01) {
+            dst[mad24(r1, ne0, first_row + r)] = tot;
+        }
+    }
+}
+
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_32
 #elif defined (ADRENO_GPU)

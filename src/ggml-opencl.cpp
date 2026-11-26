@@ -596,6 +596,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_bf16_f32_l4;
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_q8_0_f32;
+    cl_kernel kernel_mul_mat_q8_0_f32_8x;
 	cl_kernel kernel_mul_mat_q4_0_f32;
 	cl_kernel kernel_mul_mat_q4_1_f32;
 
@@ -604,6 +605,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q4_1_f32;
 //    cl_kernel kernel_mul_mv_q8_0_f32;
     cl_kernel kernel_mul_mv_q4_K_f32;
+    cl_kernel kernel_mul_mat_q4_K_f32_8x;
     cl_kernel kernel_mul_mv_q5_K_f32;
     cl_kernel kernel_mul_mv_q6_K_f32;
     cl_kernel kernel_mul_mv_bf16_f32;
@@ -1272,71 +1274,16 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
                       finite ? "finite+fast+unsafe" : "strict (no finite/fast/unsafe)");
     }
     backend_ctx->program    = build_program_from_source(context, device, kernel_src.c_str(),    compile_opts);
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_q8_src {
+        #include "ggml-opencl_q8.cl.h"
+    };
+#else
+    const std::string kernel_q8_src = read_file("ggml-opencl_q8.cl");
+#endif
     // Q8_0 CPY: без -cl-mad-enable и fast-math, иначе bf16→q8_0 расходится с AVX vdivss/vrndscaleps.
-    static const char * q8_src = R"ocl(
-struct __attribute__((packed)) block_q8_0 { half d; char qs[32]; };
-inline void quant_block(float x[32], global struct block_q8_0 * y) {
-    float amax = 0.f;
-    for (int j = 0; j < 32; ++j) amax = fmax(amax, fabs(x[j]));
-    float d = 0.f, id = 0.f;
-    if (amax != 0.f) { d = amax / 127.f; id = 127.f / amax; }
-    y->d = convert_half_rte(d);
-    for (int j = 0; j < 32; ++j) {
-        float r = rint(x[j] * id);
-        int q = (int) r;
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        y->qs[j] = (char) q;
-    }
-}
-#define IDX(b, ne0, ne1, ne2, i0, i1, i2, i3) \
-    do { int _i=(b)*32; int _n0=(ne0)>0?(ne0):1; int _n1=(ne1)>0?(ne1):1; int _n2=(ne2)>0?(ne2):1; int _t=_i/_n0; \
-         (i0)=_i%_n0; (i1)=_t%_n1; _t/=_n1; (i2)=_t%_n2; (i3)=_t/_n2; } while (0)
-kernel void kernel_cpy_f32_q8_0(global char * src, ulong off0, global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3, ulong nb00, ulong nb01, ulong nb02, ulong nb03, int nblocks) {
-    int b = get_global_id(0); if (b >= nblocks) return;
-    int i0,i1,i2,i3; IDX(b,ne0,ne1,ne2,i0,i1,i2,i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[32];
-    for (int j = 0; j < 32; ++j) x[j] = *(global float *)(src + base + (ulong)j*nb00);
-    quant_block(x, (global struct block_q8_0 *)(dst + off1) + b); (void)ne3;
-}
-kernel void kernel_cpy_f16_q8_0(global char * src, ulong off0, global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3, ulong nb00, ulong nb01, ulong nb02, ulong nb03, int nblocks) {
-    int b = get_global_id(0); if (b >= nblocks) return;
-    int i0,i1,i2,i3; IDX(b,ne0,ne1,ne2,i0,i1,i2,i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[32];
-    for (int j = 0; j < 32; ++j) x[j] = *(global half *)(src + base + (ulong)j*nb00);
-    quant_block(x, (global struct block_q8_0 *)(dst + off1) + b); (void)ne3;
-}
-kernel void kernel_cpy_bf16_q8_0(global char * src, ulong off0, global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3, ulong nb00, ulong nb01, ulong nb02, ulong nb03, int nblocks) {
-    int b = get_global_id(0); if (b >= nblocks) return;
-    int i0,i1,i2,i3; IDX(b,ne0,ne1,ne2,i0,i1,i2,i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[32];
-    for (int j = 0; j < 32; ++j) {
-        ushort u = *(global ushort *)(src + base + (ulong)j*nb00);
-        x[j] = as_float((uint)u << 16);
-    }
-    quant_block(x, (global struct block_q8_0 *)(dst + off1) + b); (void)ne3;
-}
-kernel void kernel_cpy_q8_0_f32(global char * src, ulong off0, global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3, ulong nb00, ulong nb01, ulong nb02, ulong nb03,
-        ulong nb0, ulong nb1, ulong nb2, ulong nb3, int nblocks) {
-    int b = get_global_id(0); if (b >= nblocks) return;
-    int i0,i1,i2,i3; IDX(b,ne0,ne1,ne2,i0,i1,i2,i3);
-    ulong sbase = off0 + (ulong)(i0/32)*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    global struct block_q8_0 * blk = (global struct block_q8_0 *)(src + sbase);
-    float d = convert_float(blk->d);
-    ulong dbase = off1 + (ulong)i0*nb0 + (ulong)i1*nb1 + (ulong)i2*nb2 + (ulong)i3*nb3;
-    for (int j = 0; j < 32; ++j)
-        *(global float *)(dst + dbase + (ulong)j*nb0) = (float)blk->qs[j] * d;
-    (void)ne3;
-}
-)ocl";
-    backend_ctx->program_q8 = build_program_from_source(context, device, q8_src, std::string("-cl-std=CL3.0"));
+    // Проба, не релиз. Источник — kernels/ggml-opencl_q8.cl.
+    backend_ctx->program_q8 = build_program_from_source(context, device, kernel_q8_src.c_str(), std::string("-cl-std=CL3.0"));
     backend_ctx->program_mv = build_program_from_source(context, device, kernel_mv_src.c_str(), compile_opts);
     backend_ctx->program_la = build_program_from_source(context, device, kernel_la_src.c_str(), compile_opts);
     backend_ctx->program_1  = build_program_from_source(context, device, kernel_mm_src.c_str(), compile_opts);
@@ -1562,6 +1509,7 @@ kernel void kernel_cpy_q8_0_f32(global char * src, ulong off0, global char * dst
         CL_CHECK((backend_ctx->kernel_mul_mat_bf16_f32_l4    = clCreateKernel(backend_ctx->program, "kernel_mul_mat_bf16_f32_l4", &err), err));
     }
     CL_CHECK((backend_ctx->kernel_mul_mat_q8_0_f32       = clCreateKernel(backend_ctx->program, "kernel_mul_mat_q8_0_f32", &err), err));
+    CL_CHECK((backend_ctx->kernel_mul_mat_q8_0_f32_8x    = clCreateKernel(backend_ctx->program, "kernel_mul_mat_q8_0_f32_8x", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mat_q4_0_f32       = clCreateKernel(backend_ctx->program, "kernel_mul_mat_q4_0_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mat_q4_1_f32       = clCreateKernel(backend_ctx->program, "kernel_mul_mat_q4_1_f32", &err), err));
 
@@ -1596,6 +1544,7 @@ kernel void kernel_cpy_q8_0_f32(global char * src, ulong off0, global char * dst
 //    CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32                  = clCreateKernel(backend_ctx->program_1, "kernel_mul_mv_q8_0K_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mv_q4_0_f32                  = clCreateKernel(backend_ctx->program_1, "kernel_mul_mv_q4_0_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32                  = clCreateKernel(backend_ctx->program_1, "kernel_mul_mv_q4_K_f32", &err), err));
+    CL_CHECK((backend_ctx->kernel_mul_mat_q4_K_f32_8x              = clCreateKernel(backend_ctx->program_1, "kernel_mul_mat_q4_K_f32_8x", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mv_q5_K_f32                  = clCreateKernel(backend_ctx->program_1, "kernel_mul_mv_q5_K_f32", &err), err));
     CL_CHECK((backend_ctx->kernel_mul_mv_q6_K_f32                  = clCreateKernel(backend_ctx->program_1, "kernel_mul_mv_q6_K_f32", &err), err));
 
@@ -1899,7 +1848,7 @@ static void __attribute__((destructor)) ggml_cl2_free(void) {
 // Tensor extra management
 //------------------------------------------------------------------------------
 struct ggml_tensor_extra_cl {
-    cl_event evt;// событие по которому можно синхронизовать элементы в очереди команд
+    cl_event evt = nullptr;// событие по которому можно синхронизовать элементы в очереди команд
     // The buffer object that holds the data.
     cl_mem data_device;
     // The offset into the buffer object. This is primarily for scratch buffer
@@ -1924,7 +1873,7 @@ struct ggml_tensor_extra_cl {
 // they should always be allocated from the pool. Hence, they do not have an
 // `offset`, which indicate their locations in the scratch buffer.
 struct ggml_tensor_extra_cl_q4_0 {
-    cl_event evt;// событие по которому можно синхронизовать элементы в очереди команд
+    cl_event evt = nullptr;// событие по которому можно синхронизовать элементы в очереди команд
     // Quantized values.
     cl_mem q = nullptr;
     // Quantized values in image1d_buffer_t.
@@ -2199,6 +2148,36 @@ static void qnn_reset_queue(ggml_backend_opencl_context * ctx) {
     }
 }
 
+static void qnn_quant_skew(const ggml_tensor * op, const ggml_tensor * t, int align) {
+    static int n;
+    if (n >= 40 || t == nullptr || !ggml_is_quantized(t->type)) {
+        return;
+    }
+    const char * why = nullptr;
+    if (ggml_is_transposed(t) || ggml_is_permuted(t)) {
+        why = "переставлен";
+    } else if (!ggml_is_contiguous(t)) {
+        why = "не сплошной";
+    } else if (align > 1) {
+        size_t off = t->view_offs;
+        ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) t->extra;
+        if (ex != nullptr) {
+            off += (size_t) ex->offset;
+        }
+        if (off % (size_t) align) {
+            why = "база";
+        } else if (t->nb[1] % (size_t) align) {
+            why = "строка";
+        }
+    }
+    if (why == nullptr) {
+        return;
+    }
+    n++;
+    fprintf(stderr, "квант криво %s %s %s %s\n",
+        ggml_op_name(op->op), t->name, ggml_type_name(t->type), why);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
 
 static int once = 0;
@@ -2230,11 +2209,23 @@ if (!once){
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_GET_ROWS && node->src[0]) {
+            ggml_tensor * nxt = (i + 1 < cgraph->n_nodes) ? cgraph->nodes[i + 1] : nullptr;
+            fprintf(stderr, "GET_ROWS %s %s -> %s %s %s\n",
+                node->src[0]->name, ggml_type_name(node->src[0]->type),
+                nxt ? ggml_op_name(nxt->op) : "-",
+                nxt ? nxt->name : "",
+                nxt ? ggml_type_name(nxt->type) : "");
+        }
         qnn_ensure_extra(node);
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             qnn_ensure_extra(node->src[s]);
         }
-if (0) {// optimizations
+        qnn_quant_skew(node, node, backend_ctx->alignment);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            qnn_quant_skew(node, node->src[s], backend_ctx->alignment);
+        }
+if (0) {// FFN разъединён: gate, silu, up и down — отдельные узлы. Длинный q4_K идёт в mul_mat 8x.
         if (i+3<cgraph->n_nodes)
             if (node->op==GGML_OP_MUL_MAT && cgraph->nodes[i+1]->op==GGML_OP_UNARY && cgraph->nodes[i+2]->op==GGML_OP_MUL_MAT && cgraph->nodes[i+3]->op==GGML_OP_MUL
             && node->src[1]==cgraph->nodes[i+2]->src[1] && backend_ctx->kernel_ffn[node->src[0]->type]!=nullptr){
@@ -2342,21 +2333,42 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
             }
 }// optimizations
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
-            // GGML_ASSERT(node->src[0]!=nullptr);
-
+            if (node->op == GGML_OP_TRANSPOSE && node->src[0] && ggml_is_quantized(node->src[0]->type)) {
+                ggml_tensor * nxt = (i + 1 < cgraph->n_nodes) ? cgraph->nodes[i + 1] : nullptr;
+                fprintf(stderr, "квант ломается %s %s -> %s %s\n",
+                    node->name, ggml_type_name(node->src[0]->type),
+                    nxt ? ggml_op_name(nxt->op) : "-", nxt ? nxt->name : "");
+            }
             if (node->op == GGML_OP_VIEW && 0 )
                 printf("\tOP VIEW %-15.15s base=%p offs=%6zu size=(%zu,%zu,%zu) ld=(%zu,%zu,%zu) %s\n", node->name, 
                     (char*)node->data-node->view_offs,
                     node->view_offs, node->ne[0],node->ne[1],node->ne[2], node->nb[0],node->nb[1],node->nb[2], ggml_is_transposed(node)?"(transposed)":"" );
 
-            if (node->src[0]!=nullptr && node->extra != nullptr && node->src[0]->extra != nullptr) {
-                ggml_tensor_extra_cl* extra = (ggml_tensor_extra_cl*)node->extra;
-                ggml_tensor_extra_cl* extra0 = (ggml_tensor_extra_cl*)node->src[0]->extra;
-                if (extra->evt!=nullptr){
+            if (node->op != GGML_OP_NONE) {
+                GGML_ASSERT(node->src[0] != nullptr);
+                GGML_ASSERT(node->extra != nullptr);
+                GGML_ASSERT(node->src[0]->extra != nullptr);
+                ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) node->extra;
+                ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) node->src[0]->extra;
+                static int ndump = 0;
+                if (ndump < 12) {
+                    ndump++;
+                    const ggml_tensor * s0 = node->src[0];
+                    fprintf(stderr,
+                        "empty %s '%s' %s ne %lld %lld %lld %lld nb %zu %zu %zu %zu view %zu extra %p evt %p off %llu nbytes %zu | src '%s' %s ne %lld %lld %lld nb %zu %zu %zu extra %p evt %p same %d\n",
+                        ggml_op_name(node->op), node->name, ggml_type_name(node->type),
+                        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                        node->nb[0], node->nb[1], node->nb[2], node->nb[3],
+                        node->view_offs, (void *) extra, (void *) extra->evt,
+                        (unsigned long long) extra->offset, ggml_nbytes(node),
+                        s0->name, ggml_type_name(s0->type),
+                        (long long) s0->ne[0], (long long) s0->ne[1], (long long) s0->ne[2],
+                        s0->nb[0], s0->nb[1], s0->nb[2],
+                        (void *) extra0, (void *) extra0->evt, extra == extra0);
+                }
+                if (extra != extra0 && extra->evt == nullptr && extra0->evt != nullptr) {
                     extra->evt = extra0->evt;
-                    if (extra->evt != nullptr) {
-                        CL_CHECK(clRetainEvent(extra->evt));// The event reference count is incremented.
-                    }
+                    CL_CHECK(clRetainEvent(extra->evt));
                 }
             }
             continue;
@@ -2387,6 +2399,10 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
     cl_event event_list[GGML_MAX_SRC]; UNUSED(event_list);
     int seq =0; UNUSED(seq);
     int64_t kernel_time=0;
+    int64_t op_ns[GGML_OP_COUNT] = {};
+    int64_t op_delay[GGML_OP_COUNT] = {};
+    int op_n[GGML_OP_COUNT] = {};
+    int op_noevt[GGML_OP_COUNT] = {};
     for (int i = 0; i < cgraph->n_nodes; i++){
 //        if ((i&0xFF)==0x00)  CL_CHECK(clFinish(backend_ctx->queue));
         
@@ -2407,6 +2423,15 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
             }
         }
         kernel_time += _event_measure(extra->evt, delay, duration, start);
+        if ((int) node->op >= 0 && (int) node->op < GGML_OP_COUNT) {
+            if (extra->evt == nullptr) {
+                op_noevt[node->op]++;
+            } else {
+                op_ns[node->op] += duration;
+                op_delay[node->op] += delay;
+                op_n[node->op]++;
+            }
+        }
         if (start!=0){
             if(start<total_min) total_min = start;
             if(start>total_max) total_max = start;
@@ -2468,6 +2493,33 @@ if (1) printf("OPTIMIZE KV-cache %s(%zu,%zu,%zu)(%zu,%zu,%zu)%c %s(%zu,%zu,%zu)(
 #if defined(_TEST) && _TEST>0
     printf("\e[0m kernel_time=%4.1f ms, total = %4.1f ms\n", kernel_time/(1.e6f), (total_max-total_min)*1.e-6f);
 #endif
+
+    static int nsum = 0;
+    if (nsum < 2 && cgraph->n_nodes > 100) {
+        nsum++;
+        fprintf(stderr, "graph nodes %d kernel %.1f ms\n", cgraph->n_nodes, kernel_time/1.e6);
+        int idx[GGML_OP_COUNT];
+        int n = 0;
+        for (int op = 0; op < GGML_OP_COUNT; op++) {
+            if (op_ns[op] > 0 || op_noevt[op] > 0) {
+                idx[n++] = op;
+            }
+        }
+        for (int a = 0; a < n; a++) {
+            for (int b = a + 1; b < n; b++) {
+                if (op_ns[idx[b]] > op_ns[idx[a]]) {
+                    int t = idx[a];
+                    idx[a] = idx[b];
+                    idx[b] = t;
+                }
+            }
+        }
+        for (int a = 0; a < n && a < 12; a++) {
+            int op = idx[a];
+            fprintf(stderr, "  %-16s %8.1f ms  wait %8.1f ms  n %d  noevt %d\n",
+                ggml_op_name((enum ggml_op) op), op_ns[op]/1.e6, op_delay[op]/1.e6, op_n[op], op_noevt[op]);
+        }
+    }
 
     qnn_in_graph = 0;
     if (qnn_op_bad == 0 && qnn_cl_err == 0) {
@@ -2974,6 +3026,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_SOFT_MAX_BACK:
             return false;
         default: {
+            static int nlog = 0;
+            if (nlog < 24) {
+                fprintf(stderr, "supports_op no: %s %s\n", ggml_op_name(op->op), op->name);
+                nlog++;
+            }
             return false;
         }
     }
@@ -3994,8 +4051,8 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
 }
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
-        case GGML_OP_GET_ROWS:// этот запрос отвечает за embedded layer выборка строки из матрицы, вызывает задержку, видимо нужна синхронизация
-            return (ggml_is_quantized(op->src[0]->type)/* ||  op->ne[1]>1 || op->ne[2]>1 */)?0:op->ne[0];
+        case GGML_OP_GET_ROWS:// embedded layer: выборка строки. На тонком PCIe не увозим, пустой RESHAPE потом держит это событие.
+            return 0;
 //            return (!ggml_is_contiguous(op->src[0]) || !ggml_is_scalar(op->src[1])/* ||  op->ne[1]>1 || op->ne[2]>1 */)?0:op->ne[0];
 //            return op->ne[0];
         case GGML_OP_MUL_MAT:
@@ -6815,6 +6872,119 @@ static void ggml_cl_ffn         (ggml_backend_t backend, const ggml_tensor * src
 }
 
 
+
+static bool qnn_q8_row_skew(const ggml_backend_opencl_context * ctx, const ggml_tensor * t) {
+    return t != nullptr && t->type == GGML_TYPE_Q8_0 && ctx->alignment > 1
+        && (t->nb[1] % (size_t) ctx->alignment) != 0;
+}
+
+static cl_mem qnn_q8_bf16(ggml_backend_opencl_context * ctx, cl_command_queue queue, const ggml_tensor * src) {
+    ggml_tensor_extra_cl * ex = (ggml_tensor_extra_cl *) src->extra;
+    cl_ulong off = ex->offset + src->view_offs;
+    static std::map<std::pair<cl_mem, cl_ulong>, cl_mem> got;
+    auto key = std::make_pair(ex->data_device, off);
+    auto it = got.find(key);
+    if (it != got.end()) {
+        return it->second;
+    }
+    static cl_kernel kern = nullptr;
+    if (kern == nullptr) {
+        const char * text =
+            "struct __attribute__((packed)) block_q8_0 { half d; char qs[32]; };\n"
+            "kernel void kernel_q8_0_bf16(global char * src, ulong off, global ushort * dst, int nblocks) {\n"
+            "    int b = get_global_id(0);\n"
+            "    if (b >= nblocks) return;\n"
+            "    global struct block_q8_0 * y = ((global struct block_q8_0 *)(src + off)) + b;\n"
+            "    float d = convert_float(y->d);\n"
+            "    for (int j = 0; j < 32; ++j) {\n"
+            "        uint u = as_uint((float)y->qs[j] * d);\n"
+            "        uint lsb = (u >> 16) & 1u;\n"
+            "        dst[b * 32 + j] = (ushort)((u + 0x7fffu + lsb) >> 16);\n"
+            "    }\n"
+            "}\n";
+        cl_int err = 0;
+        cl_program prog = clCreateProgramWithSource(ctx->context, 1, &text, nullptr, &err);
+        CL_CHECK(err);
+        err = clBuildProgram(prog, 1, &ctx->device, "-cl-std=CL3.0", nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            size_t n = 0;
+            clGetProgramBuildInfo(prog, ctx->device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
+            std::string log(n, '\0');
+            clGetProgramBuildInfo(prog, ctx->device, CL_PROGRAM_BUILD_LOG, n, log.data(), nullptr);
+            fprintf(stderr, "q8 -> bf16 build\n%s\n", log.c_str());
+            qnn_op_bad = 1;
+            return nullptr;
+        }
+        kern = clCreateKernel(prog, "kernel_q8_0_bf16", &err);
+        CL_CHECK(err);
+    }
+    const int nblocks = (int) (ggml_nelements(src) / 32);
+    cl_int err = 0;
+    cl_mem dst = clCreateBuffer(ctx->context, CL_MEM_READ_WRITE, (size_t) nblocks * 32 * 2, nullptr, &err);
+    CL_CHECK(err);
+    CL_CHECK(clSetKernelArg(kern, 0, sizeof(cl_mem), &ex->data_device));
+    CL_CHECK(clSetKernelArg(kern, 1, sizeof(cl_ulong), &off));
+    CL_CHECK(clSetKernelArg(kern, 2, sizeof(cl_mem), &dst));
+    CL_CHECK(clSetKernelArg(kern, 3, sizeof(int), &nblocks));
+    size_t g = nblocks == 0 ? 0 : ((size_t) nblocks + 63) / 64 * 64;
+    size_t l = 64;
+    cl_event ev = nullptr;
+    if (g > 0) {
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kern, 1, nullptr, &g, &l,
+            ex->evt ? 1 : 0, ex->evt ? &ex->evt : nullptr, &ev));
+        CL_CHECK(clWaitForEvents(1, &ev));
+        clReleaseEvent(ev);
+    }
+    fprintf(stderr, "q8 -> bf16 %s\n", src->name);
+    got[key] = dst;
+    return dst;
+}
+
+static bool qnn_mul_q8_bf16(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_backend_opencl_context * ctx = (ggml_backend_opencl_context *) backend->context;
+    return false;
+    if (src0->ne[2] != 1 || src1->ne[2] != 1) {
+        return false;
+    }
+    cl_mem A = qnn_q8_bf16(ctx, ctx->queue, src0);
+    if (A == nullptr) {
+        return true;
+    }
+    cl_mem B = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
+    cl_mem C = _get_cl_buffer(dst, CL_MEM_WRITE_ONLY);
+    cl_kernel kernel = ctx->kernel_mul_mat_bf16_f32;
+    cl_uint ne00 = (cl_uint) src0->ne[0];
+    cl_uint nb01 = ne00 * 2;
+    cl_uint nb02 = (cl_uint) src0->ne[1] * nb01;
+    cl_uint nb11 = (cl_uint) src1->nb[1];
+    cl_uint nb12 = (cl_uint) src1->nb[2];
+    cl_uint ne0 = (cl_uint) dst->ne[0];
+    cl_uint ne1 = (cl_uint) dst->ne[1];
+    cl_uint r2 = 1;
+    int a = 0;
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &A));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &B));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem), &C));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &ne00));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &nb01));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &nb02));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &ne0));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &ne1));
+    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_uint), &r2));
+    size_t local[3] = {32, 1, 1};
+    size_t global[3] = {(size_t) src0->ne[1] * 32, (size_t) src1->ne[1], 1};
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+    cl_event evs[GGML_MAX_SRC];
+    cl_int nwait = _event_list(dst, evs);
+    CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, kernel, 3, nullptr, global, local,
+        nwait > 0 ? (cl_uint) nwait : 0, nwait > 0 ? evs : nullptr, &extrad->evt));
+    clReleaseMemObject(B);
+    clReleaseMemObject(C);
+    return true;
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     if (src0) {
     } else {
@@ -7437,8 +7607,81 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
                 CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
                 break;
-            default:
+            case GGML_TYPE_Q4_K: {
+                if (ne12*ne13 == 1 && ne02 == 1 && (ne00 % 256) == 0) {
+                } else {
+                    break;
+                }
+                nth0 = 32; nth1 = 1; ndst = 8;
+                kernel = backend_ctx->kernel_mul_mat_q4_K_f32_8x;
+                cl_mem A_k = _get_cl_buffer(src0, CL_MEM_READ_ONLY);
+                cl_mem B_k = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
+                cl_mem C_k = _get_cl_buffer(dst,  CL_MEM_WRITE_ONLY);
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem), &A_k));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem), &B_k));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem), &C_k));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_uint), &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_uint), &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_uint), &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_uint), &ne10));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_uint), &ne12));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_uint), &ne0));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_uint), &ne1));
+                {
+                    size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, (size_t)ne11*nth1, 1};
+                    size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
+                    cl_event event_list[GGML_MAX_SRC];
+                    cl_uint event_list_len = _event_list(dst, event_list);
+                    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
+                }
+                CL_CHECK(clReleaseMemObject(A_k));
+                CL_CHECK(clReleaseMemObject(B_k));
+                CL_CHECK(clReleaseMemObject(C_k));
+                return;
+            }
+            case GGML_TYPE_Q8_0: {
+                if (qnn_mul_q8_bf16(backend, src0, src1, dst)) return;
+                if (ne12*ne13 == 1 && ne02 == 1 && (ne00 % 32) == 0) {
+                } else {
+                    break;
+                }
+                nth0 = 32; nth1 = 1; ndst = 8;
+                kernel = backend_ctx->kernel_mul_mat_q8_0_f32_8x;
+                cl_mem A_q = _get_cl_buffer(src0, CL_MEM_READ_ONLY);
+                cl_mem B_q = _get_cl_buffer(src1, CL_MEM_READ_ONLY);
+                cl_mem C_q = _get_cl_buffer(dst,  CL_MEM_WRITE_ONLY);
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem), &A_q));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem), &B_q));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem), &C_q));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_uint), &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_uint), &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_uint), &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_uint), &ne10));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_uint), &ne12));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_uint), &ne0));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_uint), &ne1));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb01));
+                {
+                    size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, (size_t)ne11*nth1, 1};
+                    size_t local_work_size[]  = {(size_t)nth0, (size_t)nth1, 1};
+                    cl_event event_list[GGML_MAX_SRC];
+                    cl_uint event_list_len = _event_list(dst, event_list);
+                    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, event_list_len, event_list_len ? event_list : NULL, &extrad->evt));
+                }
+                CL_CHECK(clReleaseMemObject(A_q));
+                CL_CHECK(clReleaseMemObject(B_q));
+                CL_CHECK(clReleaseMemObject(C_q));
+                return;
+            }
+            default: {
+                static int nlog = 0;
+                if (nlog < 8) {
+                    fprintf(stderr, "mul_mat ne11>2 no else: src0=%s ne00=%d ne01=%d ne11=%d %s\n",
+                        ggml_type_name(src0t), ne00, ne01, ne11, src0->name);
+                    nlog++;
+                }
                 break;
+            }
         }
 
         // Launch kernel.
@@ -7765,6 +8008,7 @@ if (src1->ne[0]*src1->nb[0]< src1->nb[1] && src1->nb[2]==src1->ne[1]*src1->nb[1]
 
 		} break;
         case GGML_TYPE_Q8_0:{
+            if (qnn_mul_q8_bf16(backend, src0, src1, dst)) return;
             if (ne12*ne13==1) {
             } else {
                 GGML_LOG_ERROR("qnn_ocl: %s:%d %s\n", __FILE__, __LINE__, "static void ggml_cl_mul_mat");

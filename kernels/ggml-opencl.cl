@@ -4465,118 +4465,6 @@ if (nb00==sizeof(float) && ne00%get_max_sub_group_size()==0){// выделить
 }
 
 
-// CPY → Q8_0. Один блок = 32 значения. d = amax/127, qs = round-nearest-even
-// (как AVX _MM_ROUND_NEAREST), затем насыщение в int8. dst — плотные блоки.
-inline void quant_f32_block_q8_0(float x[QK8_0], global struct block_q8_0 * y) {
-    // AVX quantize_row_q8_0: vdivss max/127, id=127/max, vrndscaleps $0, packsswb.
-    float amax = 0.f;
-    for (int j = 0; j < QK8_0; ++j) {
-        amax = fmax(amax, fabs(x[j]));
-    }
-    const float d = amax / 127.f;
-    const float id = (amax != 0.f) ? (127.f / amax) : 0.f;
-    y->d = convert_half_rte(d);
-    for (int j = 0; j < QK8_0; ++j) {
-        y->qs[j] = convert_char_sat_rte(x[j] * id);
-    }
-}
-
-#define CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3) \
-    do { \
-        int _i = (b) * QK8_0; \
-        int _n0 = (ne0) > 0 ? (ne0) : 1; \
-        int _n1 = (ne1) > 0 ? (ne1) : 1; \
-        int _n2 = (ne2) > 0 ? (ne2) : 1; \
-        int _t = _i / _n0; \
-        (i0) = _i % _n0; \
-        (i1) = _t % _n1; \
-        _t /= _n1; \
-        (i2) = _t % _n2; \
-        (i3) = _t / _n2; \
-    } while (0)
-
-kernel void kernel_cpy_f32_q8_0(
-        global char * src, ulong off0,
-        global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3,
-        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
-        int nblocks) {
-    int b = get_global_id(0);
-    if (b >= nblocks) return;
-    int i0, i1, i2, i3;
-    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[QK8_0];
-    for (int j = 0; j < QK8_0; ++j) {
-        x[j] = *(global float *)(src + base + (ulong)j*nb00);
-    }
-    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
-    quant_f32_block_q8_0(x, y);
-    (void) ne3;
-}
-
-kernel void kernel_cpy_f16_q8_0(
-        global char * src, ulong off0,
-        global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3,
-        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
-        int nblocks) {
-    int b = get_global_id(0);
-    if (b >= nblocks) return;
-    int i0, i1, i2, i3;
-    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[QK8_0];
-    for (int j = 0; j < QK8_0; ++j) {
-        x[j] = *(global half *)(src + base + (ulong)j*nb00);
-    }
-    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
-    quant_f32_block_q8_0(x, y);
-    (void) ne3;
-}
-
-kernel void kernel_cpy_bf16_q8_0(
-        global char * src, ulong off0,
-        global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3,
-        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
-        int nblocks) {
-    int b = get_global_id(0);
-    if (b >= nblocks) return;
-    int i0, i1, i2, i3;
-    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
-    ulong base = off0 + (ulong)i0*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    float x[QK8_0];
-    for (int j = 0; j < QK8_0; ++j) {
-        ushort u = *(global ushort *)(src + base + (ulong)j*nb00);
-        x[j] = as_float((uint)u << 16);
-    }
-    global struct block_q8_0 * y = (global struct block_q8_0 *)(dst + off1) + b;
-    quant_f32_block_q8_0(x, y);
-    (void) ne3;
-}
-
-kernel void kernel_cpy_q8_0_f32(
-        global char * src, ulong off0,
-        global char * dst, ulong off1,
-        int ne0, int ne1, int ne2, int ne3,
-        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
-        ulong nb0, ulong nb1, ulong nb2, ulong nb3,
-        int nblocks) {
-    int b = get_global_id(0);
-    if (b >= nblocks) return;
-    int i0, i1, i2, i3;
-    CPY_BLOCK_INDEX(b, ne0, ne1, ne2, i0, i1, i2, i3);
-    ulong sbase = off0 + (ulong)(i0 / QK8_0)*nb00 + (ulong)i1*nb01 + (ulong)i2*nb02 + (ulong)i3*nb03;
-    global struct block_q8_0 * blk = (global struct block_q8_0 *)(src + sbase);
-    float d = convert_float(blk->d);
-    ulong dbase = off1 + (ulong)i0*nb0 + (ulong)i1*nb1 + (ulong)i2*nb2 + (ulong)i3*nb3;
-    for (int j = 0; j < QK8_0; ++j) {
-        *(global float *)(dst + dbase + (ulong)j*nb0) = (float)blk->qs[j] * d;
-    }
-    (void) ne3;
-}
-
 //------------------------------------------------------------------------------
 // get_rows по шаблону для данной квантизации
 //------------------------------------------------------------------------------
@@ -5798,6 +5686,74 @@ kernel void kernel_mul_mat_q8_0_f32(
 */
     mul_vec_q8_0_f32(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, 1, 1);
 }
+
+inline float block_q_8_0_dot_yl(global struct block_q8_0 * qb, private float4 * yv) {
+    float4 acc = (float4)(0.f);
+    #pragma unroll
+    for (uint j = 0; j < 8; j++) {
+        char4 q4 = vload4(j, (global char *) qb->qs);
+        acc = fma(convert_float4(q4), yv[j], acc);
+    }
+    return (acc.s0 + acc.s1 + acc.s2 + acc.s3) * (float) qb->d;
+}
+
+#ifdef INTEL_GPU
+REQD_SUBGROUP_SIZE_32
+#elif defined (ADRENO_GPU)
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_mul_mat_q8_0_f32_8x(
+        global void * src0,
+        global float * src1,
+        global float * dst,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne12,
+        int ne0,
+        int ne1,
+        ulong nb01
+) {
+    const uint ndst = 8;
+    const uint nb = ne00/QK8_0;
+    const uint r0 = get_group_id(0);
+    const uint r1 = get_group_id(1);
+    const uint first_row = r0 * ndst;
+    if (first_row >= (uint) ne01) {
+        return;
+    }
+
+    global char * srcb = (global char *) src0;
+    global float * y = (global float *) src1 + r1 * (uint) ne10;
+
+    const uint stride = get_sub_group_size();
+    const uint ix = get_sub_group_local_id();
+    float sumf[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (uint ib = ix; ib < nb; ib += stride) {
+        float4 yv[8];
+        global float * yb = y + QK8_0 * ib;
+        #pragma unroll
+        for (uint j = 0; j < 8; j++) {
+            yv[j] = vload4(j, yb);
+        }
+        #pragma unroll
+        for (uint row = 0; row < ndst; row++) {
+            if (first_row + row < (uint) ne01) {
+                sumf[row] += block_q_8_0_dot_yl(
+                    (global struct block_q8_0 *)(srcb + (ulong)(first_row + row) * nb01 + (ulong) ib * sizeof(struct block_q8_0)),
+                    yv);
+            }
+        }
+    }
+    for (uint row = 0; row < ndst; row++) {
+        float tot = sub_group_reduce_add(sumf[row]);
+        if (get_sub_group_local_id() == 0 && first_row + row < (uint) ne01) {
+            dst[mad24((int) r1, ne0, (int) first_row + (int) row)] = tot;
+        }
+    }
+}
+
 #ifdef INTEL_GPU
 REQD_SUBGROUP_SIZE_16
 #elif defined (ADRENO_GPU)
